@@ -64,7 +64,10 @@ Windows 10/11 x64，无需安装 Python 或 FFmpeg。
 ### v1.0.0
 - 初始版本发布
 
-## 开源声明
-
-本软件内置 [FFmpeg](https://ffmpeg.org)，遵循 [GPL v3 许可证](https://www.gnu.org/licenses/gpl-3.0.html)。
-FFmpeg 版权归其原作者所有。
+FFmpeg 第三方声明
+本软件随发布包分发 FFmpeg，用于视频处理功能。FFmpeg 为独立开源项目，本项目不拥有 FFmpeg 的版权。
+本发布脚本使用 BtbN/FFmpeg-Builds 提供的 Windows x64 GPL 构建。具体许可证请以实际 FFmpeg 构建包随附文本为准。
+FFmpeg：https://ffmpeg.org/
+FFmpeg License：https://ffmpeg.org/legal.html
+BtbN/FFmpeg-Builds：https://github.com/BtbN/FFmpeg-Builds
+GNU GPL v3：https://www.gnu.org/licenses/gpl-3.0.html
