@@ -5,7 +5,7 @@
 运行: pythonw video_watermark.py
 """
 
-APP_VERSION  = "v1.5.0"
+APP_VERSION  = "v1.5.1"
 REPO         = "bstbuku-ship-it/video-watermark"
 RELEASES_URL = f"https://github.com/{REPO}/releases/latest"
 API_URL      = f"https://api.github.com/repos/{REPO}/releases/latest"
@@ -250,6 +250,35 @@ class UpdateChecker(QThread):
             self.result.emit(tag, url, body)
         except Exception as e:
             self.error.emit(str(e))
+
+
+class StartupCheckWorker(QThread):
+    """后台完成 FFmpeg / 编码器检测，避免启动阶段阻塞 Qt 主线程。"""
+    finished = pyqtSignal(bool, str, str)  # ffmpeg_ok, version, encoder
+
+    def run(self):
+        ff = _find_bin("ffmpeg")
+        version = ""
+        ffmpeg_ok = False
+        try:
+            r = subprocess.run(
+                [ff, "-version"], capture_output=True, text=True,
+                timeout=5, creationflags=NO_WINDOW)
+            if r.returncode == 0:
+                ffmpeg_ok = True
+                first = (r.stdout or "").splitlines()[0] if r.stdout else ""
+                m = re.search(r"version\s+([^\s]+)", first)
+                version = m.group(1) if m else ""
+        except Exception:
+            pass
+
+        encoder = "libx264"
+        if ffmpeg_ok:
+            try:
+                encoder = detect_encoder()
+            except Exception:
+                encoder = "libx264"
+        self.finished.emit(ffmpeg_ok, version, encoder)
 
 
 class WatermarkWorker(QThread):
@@ -561,7 +590,8 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._theme()
         self._set_icon()
-        QTimer.singleShot(100, self._check_ffmpeg)
+        # 启动阶段只安排后台任务，绝不在 GUI 线程执行 ffmpeg / 编码器探测。
+        QTimer.singleShot(0, self._start_startup_checks)
         QTimer.singleShot(2000, self._auto_check_update)
         QTimer.singleShot(50, self._load_settings)  # 启动后静默检测
 
@@ -1162,21 +1192,42 @@ class MainWindow(QMainWindow):
         self.start_btn.setStyleSheet(self._bstyle("#3498DB","#2980b9"))
         QMessageBox.information(self, "完成", f"全部 {self._total} 个文件处理完毕！")
 
-    def _check_ffmpeg(self):
-        ff = _find_bin("ffmpeg")
-        try:
-            r   = subprocess.run([ff,"-version"],capture_output=True,text=True,timeout=5,creationflags=NO_WINDOW)
-            ver = r.stdout.split("version")[1].split()[0] if "version" in r.stdout else ""
-            self.tag_lbl.setText(f"  ✓  FFmpeg {ver}")
-            self.tag_lbl.setStyleSheet("font-size:11px;background:#1a3d2b;color:#27ae60;border-radius:10px;padding:2px 10px;")
-            QTimer.singleShot(300, self._detect_enc_async)
-        except Exception:
+    def _start_startup_checks(self):
+        """启动后台环境检测；主窗口无需等待 FFmpeg 探测完成。"""
+        self.tag_lbl.setText("  ⏳  正在检测 FFmpeg…")
+        self.tag_lbl.setStyleSheet(
+            "font-size:11px;background:#2d3440;color:#f1c40f;"
+            "border-radius:10px;padding:2px 10px;")
+        self.start_btn.setEnabled(False)
+
+        self._startup_worker = StartupCheckWorker()
+        self._startup_worker.finished.connect(self._on_startup_checks_finished)
+        self._startup_worker.start()
+
+    def _on_startup_checks_finished(self, ok, version, encoder):
+        if not ok:
             self.tag_lbl.setText("  ✗  未找到 FFmpeg")
-            self.tag_lbl.setStyleSheet("font-size:11px;background:#3d1a1a;color:#e74c3c;border-radius:10px;padding:2px 10px;")
+            self.tag_lbl.setStyleSheet(
+                "font-size:11px;background:#3d1a1a;color:#e74c3c;"
+                "border-radius:10px;padding:2px 10px;")
             self.start_btn.setEnabled(False)
+            return
+
+        self.tag_lbl.setText(f"  ✓  FFmpeg {version}" if version else "  ✓  FFmpeg")
+        self.tag_lbl.setStyleSheet(
+            "font-size:11px;background:#1a3d2b;color:#27ae60;"
+            "border-radius:10px;padding:2px 10px;")
+        self._on_encoder(encoder)
+        self.start_btn.setEnabled(True)
+        self._startup_worker = None
+
+    def _check_ffmpeg(self):
+        """兼容旧调用入口；实际检测统一转入后台线程。"""
+        self._start_startup_checks()
 
     def _detect_enc_async(self):
-        self._on_encoder(detect_encoder())
+        """兼容旧调用入口；编码器探测已包含在 StartupCheckWorker。"""
+        self._start_startup_checks()
 
     # ── 更新检测 ─────────────────────────────────────────────────
     _update_url  = ""   # 记录最新版下载链接
@@ -1318,7 +1369,11 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, e):
         self._save_settings()
-        if self.worker and self.worker.isRunning(): self.worker.stop(); self.worker.wait(3000)
+        if self.worker and self.worker.isRunning():
+            self.worker.stop(); self.worker.wait(3000)
+        if getattr(self, "_startup_worker", None) and self._startup_worker.isRunning():
+            self._startup_worker.requestInterruption()
+            self._startup_worker.wait(1000)
         e.accept()
 
 
@@ -1375,29 +1430,28 @@ def create_splash():
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setApplicationName("视频批量加水印")
+    app.setApplicationVersion(APP_VERSION)
 
-    # 启动画面
+    # 启动画面：先显示，再异步创建主窗口。这样打包后的 EXE 即使初始化较慢，
+    # 用户也会立即看到反馈，而不是面对长时间空白。
     splash_pix, bar_info = create_splash()
     splash = QSplashScreen(splash_pix, Qt.WindowType.WindowStaysOnTopHint)
     splash.setWindowFlag(Qt.WindowType.FramelessWindowHint)
     splash.show()
     app.processEvents()
 
-    # 进度条动画（分 10 步推进）
     from PyQt6.QtGui import QBrush, QPen, QColor as QC
     from PyQt6.QtCore import QRectF
     bar_x, bar_y, bar_w, bar_h = bar_info
 
     def update_progress(step):
-        pct = step / 10
+        pct = max(0.0, min(1.0, step / 10.0))
         cur_w = int(bar_w * pct)
         p2 = QPainter(splash_pix)
         p2.setRenderHint(QPainter.RenderHint.Antialiasing)
-        # 清除旧进度
         p2.setBrush(QBrush(QC("#1e2d45")))
         p2.setPen(Qt.PenStyle.NoPen)
         p2.drawRoundedRect(QRectF(bar_x, bar_y, bar_w, bar_h), 2, 2)
-        # 画新进度
         if cur_w > 0:
             p2.setBrush(QBrush(QC("#3498DB")))
             p2.drawRoundedRect(QRectF(bar_x, bar_y, cur_w, bar_h), 2, 2)
@@ -1405,16 +1459,25 @@ if __name__ == "__main__":
         splash.setPixmap(splash_pix)
         app.processEvents()
 
-    # 每 150ms 推一步，共 10 步 = 1.5 秒
-    for i in range(1, 11):
-        QTimer.singleShot(i * 150, lambda s=i: update_progress(s))
+    # 只做非常短的视觉反馈，不再人为等待 1.6 秒。
+    for i, delay in enumerate((30, 90, 160), start=1):
+        QTimer.singleShot(delay, lambda s=i: update_progress(s))
 
-    # 加载主窗口
-    win = MainWindow()
+    win_holder = {"win": None}
 
-    def show_main():
-        splash.finish(win)
-        win.show()
+    def build_main_window():
+        try:
+            win_holder["win"] = MainWindow()
+            # 主窗口 UI 已经建立，立即结束 splash；FFmpeg/编码器检测在后台继续。
+            update_progress(10)
+            splash.finish(win_holder["win"])
+            win_holder["win"].show()
+            win_holder["win"].raise_()
+            win_holder["win"].activateWindow()
+        except Exception as exc:
+            splash.close()
+            QMessageBox.critical(None, "启动失败", f"程序启动失败：\n{exc}")
+            raise
 
-    QTimer.singleShot(1600, show_main)
+    QTimer.singleShot(0, build_main_window)
     sys.exit(app.exec())
