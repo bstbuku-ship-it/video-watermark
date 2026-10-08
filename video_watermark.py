@@ -5,12 +5,12 @@
 运行: pythonw video_watermark.py
 """
 
-APP_VERSION  = "v1.5.1"
+APP_VERSION  = "v1.5.2"
 REPO         = "bstbuku-ship-it/video-watermark"
 RELEASES_URL = f"https://github.com/{REPO}/releases/latest"
 API_URL      = f"https://api.github.com/repos/{REPO}/releases/latest"
 
-import sys, os, subprocess, platform, re, base64, tempfile
+import sys, os, subprocess, platform, re, base64, tempfile, hashlib
 import urllib.request, urllib.error, json
 from PyQt6.QtCore import QSettings
 from pathlib import Path
@@ -235,7 +235,8 @@ def parse_speed(line):
 
 
 class UpdateChecker(QThread):
-    result = pyqtSignal(str, str, str)   # tag, url, changelog(body)
+    # tag, release page, changelog, setup asset url, asset name, sha256 digest
+    result = pyqtSignal(str, str, str, str, str, str)
     error  = pyqtSignal(str)
 
     def run(self):
@@ -244,10 +245,77 @@ class UpdateChecker(QThread):
                 API_URL, headers={"User-Agent": "video-watermark-updater"})
             with urllib.request.urlopen(req, timeout=8) as resp:
                 data = json.loads(resp.read().decode())
+
             tag  = data.get("tag_name", "")
             url  = data.get("html_url", RELEASES_URL)
             body = (data.get("body") or "").strip()
-            self.result.emit(tag, url, body)
+
+            setup_url = ""
+            setup_name = ""
+            setup_digest = ""
+            for asset in data.get("assets", []) or []:
+                name = str(asset.get("name", ""))
+                if name.lower().endswith("-setup.exe") and name.lower().startswith("video-watermark-v"):
+                    setup_url = str(asset.get("browser_download_url", "") or "")
+                    setup_name = name
+                    digest = str(asset.get("digest", "") or "")
+                    if digest.lower().startswith("sha256:"):
+                        setup_digest = digest.split(":", 1)[1].strip().lower()
+                    break
+
+            self.result.emit(tag, url, body, setup_url, setup_name, setup_digest)
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+class UpdateDownloadWorker(QThread):
+    """后台下载新版安装包，不阻塞主界面。"""
+    progress = pyqtSignal(int, int)
+    finished = pyqtSignal(str)
+    error = pyqtSignal(str)
+
+    def __init__(self, url, expected_sha256="", filename="video-watermark-update-Setup.exe"):
+        super().__init__()
+        self.url = url
+        self.expected_sha256 = (expected_sha256 or "").lower().strip()
+        self.filename = filename or "video-watermark-update-Setup.exe"
+
+    def run(self):
+        try:
+            update_dir = Path(tempfile.gettempdir()) / "VideoWatermarkUpdate"
+            update_dir.mkdir(parents=True, exist_ok=True)
+            target = update_dir / self.filename
+            temp_path = target.with_suffix(target.suffix + ".download")
+
+            req = urllib.request.Request(
+                self.url, headers={"User-Agent": "video-watermark-updater"})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                total = int(resp.headers.get("Content-Length", "0") or 0)
+                downloaded = 0
+                digest = hashlib.sha256()
+
+                with open(temp_path, "wb") as f:
+                    while True:
+                        chunk = resp.read(1024 * 256)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        digest.update(chunk)
+                        downloaded += len(chunk)
+                        pct = int(downloaded * 100 / total) if total > 0 else 0
+                        self.progress.emit(pct, downloaded)
+
+            actual = digest.hexdigest().lower()
+            if self.expected_sha256 and actual != self.expected_sha256:
+                try:
+                    temp_path.unlink()
+                except Exception:
+                    pass
+                raise RuntimeError("更新文件校验失败，已停止安装。")
+
+            os.replace(str(temp_path), str(target))
+            self.progress.emit(100, downloaded)
+            self.finished.emit(str(target))
         except Exception as e:
             self.error.emit(str(e))
 
@@ -509,65 +577,78 @@ class ColorSwatch(QPushButton):
 
 
 class UpdateDialog(QDialog):
-    """展示新版本更新日志的弹窗，读取 GitHub Release 的描述文本"""
-    def __init__(self, parent, current_ver, latest_ver, changelog, url, dark=True):
+    """展示更新日志，并支持在已安装版本中后台下载新版安装包。"""
+    def __init__(self, parent, current_ver, latest_ver, changelog, url,
+                 setup_url="", setup_digest="", setup_name="",
+                 can_auto_update=False, dark=True):
         super().__init__(parent)
         self.setWindowTitle("发现新版本")
-        self.setMinimumSize(440, 380)
-        self.resize(460, 420)
+        self.setMinimumSize(440, 410)
+        self.resize(460, 450)
         self._url = url
+        self._setup_url = setup_url
+        self._setup_digest = setup_digest
+        self._setup_name = setup_name
+        self._can_auto_update = bool(can_auto_update and setup_url)
+        self._parent_window = parent
         pal = PALETTE[dark]
 
         vl = QVBoxLayout(self); vl.setContentsMargins(22,20,22,18); vl.setSpacing(12)
-
         head = QLabel("🎉  发现新版本")
         head.setStyleSheet(f"font-size:16px;font-weight:700;color:{pal['text_title']};")
         vl.addWidget(head)
-
         ver_row = QLabel(f"当前版本 {current_ver}   →   最新版本 <span style='color:#3498DB;font-weight:700;'>{latest_ver}</span>")
         ver_row.setTextFormat(Qt.TextFormat.RichText)
         ver_row.setStyleSheet(f"font-size:12.5px;color:{pal['text_secondary']};")
         vl.addWidget(ver_row)
-
         note = QLabel("更新内容：")
         note.setStyleSheet(f"font-size:12px;font-weight:600;color:{pal['text_secondary']};margin-top:4px;")
         vl.addWidget(note)
-
         self.changelog_box = QTextEdit()
         self.changelog_box.setReadOnly(True)
         self.changelog_box.setPlainText(changelog if changelog else "本次更新未提供详细说明，可前往下载页查看详情。")
-        self.changelog_box.setStyleSheet(
-            f"QTextEdit{{background:{pal['input_bg']};color:{pal['input_text']};"
-            f"border:1px solid {pal['border']};border-radius:8px;padding:10px;font-size:12.5px;}}")
+        self.changelog_box.setStyleSheet(f"QTextEdit{{background:{pal['input_bg']};color:{pal['input_text']};border:1px solid {pal['border']};border-radius:8px;padding:10px;font-size:12.5px;}}")
         vl.addWidget(self.changelog_box, stretch=1)
-
+        self.progress_label = QLabel("")
+        self.progress_label.setStyleSheet(f"font-size:11px;color:{pal['text_secondary']};")
+        self.progress_label.hide()
+        vl.addWidget(self.progress_label)
+        self.download_bar = QProgressBar()
+        self.download_bar.setRange(0,100); self.download_bar.setValue(0)
+        self.download_bar.setTextVisible(False); self.download_bar.setFixedHeight(5); self.download_bar.hide()
+        self.download_bar.setStyleSheet("QProgressBar{background:#2d2d2d;border:none;border-radius:2px;}QProgressBar::chunk{background:#3498DB;border-radius:2px;}")
+        vl.addWidget(self.download_bar)
         btn_row = QHBoxLayout(); btn_row.setSpacing(10)
-        later_btn = QPushButton("稍后再说")
-        later_btn.setFixedHeight(36)
-        later_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        later_btn.setStyleSheet(
-            f"QPushButton{{background:{pal['btn_bg']};border:1px solid {pal['btn_border']};"
-            f"border-radius:8px;color:{pal['btn_fg']};font-size:13px;}}"
-            f"QPushButton:hover{{color:{pal['btn_fg_hover']};}}")
-        later_btn.clicked.connect(self.reject)
-
-        go_btn = QPushButton("前往下载")
-        go_btn.setFixedHeight(36)
-        go_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        go_btn.setStyleSheet(
-            "QPushButton{background:#3498DB;color:white;border:none;border-radius:8px;font-size:13px;font-weight:600;}"
-            "QPushButton:hover{background:#2980b9;}")
-        go_btn.clicked.connect(self._open_and_close)
-
-        btn_row.addWidget(later_btn); btn_row.addWidget(go_btn)
-        vl.addLayout(btn_row)
-
+        self.later_btn = QPushButton("稍后再说")
+        self.later_btn.setFixedHeight(36); self.later_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.later_btn.setStyleSheet(f"QPushButton{{background:{pal['btn_bg']};border:1px solid {pal['btn_border']};border-radius:8px;color:{pal['btn_fg']};font-size:13px;}}QPushButton:hover{{color:{pal['btn_fg_hover']};}}")
+        self.later_btn.clicked.connect(self.reject)
+        self.go_btn = QPushButton("立即更新" if self._can_auto_update else "前往下载")
+        self.go_btn.setFixedHeight(36); self.go_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.go_btn.setStyleSheet("QPushButton{background:#3498DB;color:white;border:none;border-radius:8px;font-size:13px;font-weight:600;}QPushButton:hover{background:#2980b9;}")
+        if self._can_auto_update: self.go_btn.clicked.connect(self._start_update)
+        else: self.go_btn.clicked.connect(self._open_and_close)
+        btn_row.addWidget(self.later_btn); btn_row.addWidget(self.go_btn); vl.addLayout(btn_row)
         self.setStyleSheet(f"QDialog{{background:{pal['panel_bg']};}}")
+
+    def _start_update(self):
+        self.go_btn.setEnabled(False); self.later_btn.setEnabled(False); self.go_btn.setText("下载中…")
+        self.progress_label.setText("正在后台下载更新安装包，请稍候…"); self.progress_label.show()
+        self.download_bar.setValue(0); self.download_bar.show()
+        self._parent_window._start_self_update(self, self._setup_url, self._setup_digest, self._setup_name)
+
+    def set_download_progress(self, pct, downloaded):
+        self.download_bar.setValue(max(0, min(100, pct)))
+        mb = downloaded / 1024 / 1024
+        self.progress_label.setText(f"正在后台下载更新… {pct}%  ·  已下载 {mb:.1f} MB")
+
+    def set_download_error(self, message):
+        self.go_btn.setEnabled(True); self.later_btn.setEnabled(True); self.go_btn.setText("重试更新")
+        self.progress_label.setText(f"更新失败：{message}")
 
     def _open_and_close(self):
         import webbrowser
-        webbrowser.open(self._url)
-        self.accept()
+        webbrowser.open(self._url); self.accept()
 
 
 class MainWindow(QMainWindow):
@@ -1230,87 +1311,84 @@ class MainWindow(QMainWindow):
         self._start_startup_checks()
 
     # ── 更新检测 ─────────────────────────────────────────────────
-    _update_url  = ""   # 记录最新版下载链接
-    _latest_ver  = ""   # 记录最新版本号
-    _latest_body = ""   # 记录最新版更新日志
+    _update_url   = ""
+    _setup_url    = ""
+    _setup_name   = ""
+    _setup_digest = ""
+    _latest_ver   = ""
+    _latest_body  = ""
+
+    def _is_installed_build(self):
+        """只有安装版目录才自动更新；绿色版/源码版仍提供网页下载。"""
+        if not getattr(sys, "frozen", False): return False
+        try: return (Path(sys.executable).parent / "unins000.exe").exists()
+        except Exception: return False
 
     def _auto_check_update(self):
-        """启动时静默检测，结果只更新按钮状态，绝不弹窗"""
         self._run_checker(silent=True)
 
     def _check_update(self):
-        """用户手动点击：若已知有更新直接弹窗；否则重新检测"""
         if self.update_btn.text() == "有可用更新" and MainWindow._update_url:
-            self._show_update_dialog(MainWindow._latest_ver, MainWindow._update_url, MainWindow._latest_body)
+            self._show_update_dialog(MainWindow._latest_ver, MainWindow._update_url, MainWindow._latest_body, MainWindow._setup_url, MainWindow._setup_digest, MainWindow._setup_name)
             return
         self._run_checker(silent=False)
 
     def _run_checker(self, silent):
-        self._checking_silent = silent
-        self.update_btn.setEnabled(False)
-        if silent:
-            self.update_btn.setText("检测更新")
-        else:
-            self.update_btn.setText("检测中…")
+        self._checking_silent = silent; self.update_btn.setEnabled(False)
+        self.update_btn.setText("检测更新" if silent else "检测中…")
         checker = UpdateChecker()
-        checker.result.connect(self._on_update_result)
-        checker.error.connect(self._on_update_error)
-        checker.start()
-        self._updater = checker   # 防止被 GC
+        checker.result.connect(self._on_update_result); checker.error.connect(self._on_update_error)
+        checker.start(); self._updater = checker
 
     def _btn_style_default(self):
         pal = PALETTE[self._dark]
-        return (f"QPushButton{{background:transparent;border:1px solid {pal['btn_border']};"
-                f"border-radius:11px;color:{pal['btn_fg']};font-size:11px;padding:0 10px;}}"
+        return (f"QPushButton{{background:transparent;border:1px solid {pal['btn_border']};border-radius:11px;color:{pal['btn_fg']};font-size:11px;padding:0 10px;}}"
                 "QPushButton:hover{border-color:#3498DB;color:#3498DB;}")
 
-    def _on_update_result(self, latest, url, body):
-        self.update_btn.setEnabled(True)
-        silent = self._checking_silent
-        MainWindow._update_url  = url
-        MainWindow._latest_ver  = latest
-        MainWindow._latest_body = body
-
+    def _on_update_result(self, latest, url, body, setup_url, setup_name, setup_digest):
+        self.update_btn.setEnabled(True); silent = self._checking_silent
+        MainWindow._update_url=url; MainWindow._setup_url=setup_url; MainWindow._setup_name=setup_name; MainWindow._setup_digest=setup_digest
+        MainWindow._latest_ver=latest; MainWindow._latest_body=body
         if latest and latest != APP_VERSION:
-            # 有可用更新 → 橙色背景显眼提示
             self.update_btn.setText("有可用更新")
-            self.update_btn.setStyleSheet(
-                "QPushButton{background:#e67e22;border:none;"
-                "border-radius:11px;color:#fff;font-size:11px;"
-                "font-weight:600;padding:0 12px;}"
-                "QPushButton:hover{background:#d35400;}"
-                "QPushButton:pressed{background:#b94600;}")
-            self.update_btn.setToolTip(f"新版本 {latest} 可用，点击下载")
-            # 手动点击才弹窗
-            if not silent:
-                self._show_update_dialog(latest, url, body)
+            self.update_btn.setStyleSheet("QPushButton{background:#e67e22;border:none;border-radius:11px;color:#fff;font-size:11px;font-weight:600;padding:0 12px;}QPushButton:hover{background:#d35400;}QPushButton:pressed{background:#b94600;}")
+            self.update_btn.setToolTip(f"新版本 {latest} 可用，点击后可后台下载并直接更新" if setup_url and self._is_installed_build() else f"新版本 {latest} 可用，点击查看下载页")
+            if not silent: self._show_update_dialog(latest,url,body,setup_url,setup_digest,setup_name)
         else:
-            # 已是最新 → 绿色文字
             self.update_btn.setText("当前最新版 ✓")
-            self.update_btn.setStyleSheet(
-                "QPushButton{background:transparent;border:1px solid #27ae60;"
-                "border-radius:11px;color:#27ae60;font-size:11px;padding:0 10px;}"
-                "QPushButton:hover{background:rgba(39,174,96,0.1);}")
+            self.update_btn.setStyleSheet("QPushButton{background:transparent;border:1px solid #27ae60;border-radius:11px;color:#27ae60;font-size:11px;padding:0 10px;}QPushButton:hover{background:rgba(39,174,96,0.1);}")
             self.update_btn.setToolTip("")
-            if not silent:
-                QMessageBox.information(
-                    self, "检测更新", f"当前已是最新版本  {APP_VERSION} 🎉")
+            if not silent: QMessageBox.information(self,"检测更新",f"当前已是最新版本  {APP_VERSION} 🎉")
 
     def _on_update_error(self, msg):
-        self.update_btn.setEnabled(True)
-        silent = self._checking_silent
-        # 无论静默还是手动，网络失败都不弹窗，仅恢复按钮
-        self.update_btn.setText("检测更新")
-        self.update_btn.setStyleSheet(self._btn_style_default())
-        self.update_btn.setToolTip("")
-        # 手动点击时才提示网络错误
-        if not silent:
-            QMessageBox.warning(
-                self, "检测失败", "无法连接更新服务器，请检查网络连接。")
+        self.update_btn.setEnabled(True); silent=self._checking_silent
+        self.update_btn.setText("检测更新"); self.update_btn.setStyleSheet(self._btn_style_default()); self.update_btn.setToolTip("")
+        if not silent: QMessageBox.warning(self,"检测失败","无法连接更新服务器，请检查网络连接。")
 
-    def _show_update_dialog(self, latest, url, body=""):
-        dlg = UpdateDialog(self, APP_VERSION, latest, body, url, dark=self._dark)
+    def _show_update_dialog(self, latest, url, body="", setup_url="", setup_digest="", setup_name=""):
+        dlg=UpdateDialog(self,APP_VERSION,latest,body,url,setup_url=setup_url,setup_digest=setup_digest,setup_name=setup_name,can_auto_update=self._is_installed_build(),dark=self._dark)
         dlg.exec()
+
+    def _start_self_update(self, dlg, setup_url, setup_digest="", setup_name=""):
+        """后台下载新版 Setup；完成后关闭当前程序并交给安装器覆盖更新。"""
+        if not setup_url: dlg.set_download_error("没有找到新版安装包。"); return
+        filename=Path(setup_name or "video-watermark-update-Setup.exe").name
+        if not filename.lower().endswith(".exe"): filename += ".exe"
+        worker=UpdateDownloadWorker(setup_url,setup_digest,filename)
+        worker.progress.connect(dlg.set_download_progress)
+        def on_error(message):
+            dlg.set_download_error(message); self._update_download_worker=None
+        def on_finished(installer_path):
+            dlg.progress_label.setText("下载完成，正在重启安装更新…"); dlg.go_btn.setText("正在更新…"); dlg.go_btn.setEnabled(False)
+            try:
+                subprocess.Popen([installer_path,"/VERYSILENT","/SUPPRESSMSGBOXES","/CLOSEAPPLICATIONS","/NORESTART"],close_fds=True)
+            except Exception as exc:
+                dlg.set_download_error(f"无法启动安装程序：{exc}"); self._update_download_worker=None; return
+            self._update_download_worker=None
+            QTimer.singleShot(250,QApplication.instance().quit)
+        worker.error.connect(on_error); worker.finished.connect(on_finished)
+        self._update_download_worker=worker; worker.start()
+
 
     def _save_settings(self):
         s = QSettings("VideoWatermark", "Settings")
