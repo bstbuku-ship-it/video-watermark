@@ -1,28 +1,28 @@
 """
 视频批量加水印工具 v3
-依赖: pip install PyQt6
-外部依赖: ffmpeg.exe / ffprobe.exe（放同目录或加入系统 PATH）
+依赖: pip install -r requirements.txt
+外部依赖: ffmpeg.exe / ffprobe.exe（程序目录、third_party/ffmpeg 或系统 PATH）
 运行: pythonw video_watermark.py
 """
 
-APP_VERSION  = "v1.5.2"
+APP_VERSION  = "v1.5.3"
 REPO         = "bstbuku-ship-it/video-watermark"
 RELEASES_URL = f"https://github.com/{REPO}/releases/latest"
 API_URL      = f"https://api.github.com/repos/{REPO}/releases/latest"
 
 import sys, os, subprocess, platform, re, base64, tempfile, hashlib
-import urllib.request, urllib.error, json
-from PyQt6.QtCore import QSettings
+import urllib.request, urllib.error, urllib.parse, json
+from PyQt6.QtCore import QSettings, QUrl
 from pathlib import Path
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QLabel, QPushButton, QLineEdit, QSlider, QFileDialog,
     QProgressBar, QComboBox, QColorDialog, QFrame,
     QGridLayout, QMessageBox, QSizePolicy, QScrollArea,
-    QSplashScreen, QDialog, QTextEdit
+    QSplashScreen, QDialog, QTextEdit, QGraphicsDropShadowEffect
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
-from PyQt6.QtGui import QColor, QIcon, QDragEnterEvent, QDropEvent, QPixmap, QPainter, QFont, QLinearGradient
+from PyQt6.QtGui import QColor, QIcon, QDragEnterEvent, QDropEvent, QPixmap, QPainter, QFont, QLinearGradient, QDesktopServices
 
 NO_WINDOW  = subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 0
 SUPPORTED  = {".mp4",".mkv",".mov",".avi",".wmv",".flv",".webm",".m4v",".ts"}
@@ -37,6 +37,55 @@ OUTPUT_FORMATS = [
 ]
 TIME_RE    = re.compile(r"time=(\d+):(\d+):(\d+)\.(\d\d)")
 SPEED_RE   = re.compile(r"speed=\s*([\d.]+)x")
+SEMVER_RE  = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
+
+def _parse_semver(value):
+    """仅接受严格的 x.y.z 版本，避免更新检查被异常 tag 误导。"""
+    m = SEMVER_RE.match(str(value or "").strip())
+    return tuple(int(x) for x in m.groups()) if m else None
+
+
+def _escape_drawtext_text(value):
+    """按 FFmpeg filtergraph 规则安全转义用户可控的水印文字。"""
+    text = str(value or "")
+    # drawtext 默认会解释 %{...}；关闭 expansion 后再处理 filtergraph 层特殊字符。
+    text = text.replace("\\", "\\\\")
+    for ch in ("'", ":", ",", ";", "[", "]"):
+        text = text.replace(ch, "\\" + ch)
+    return text
+
+
+def _is_trusted_github_asset_url(url):
+    """自动更新只接受官方 GitHub HTTPS 下载地址。"""
+    try:
+        parsed = urllib.parse.urlparse(str(url or ""))
+        path = urllib.parse.unquote(parsed.path)
+        return (
+            parsed.scheme.lower() == "https"
+            and parsed.hostname == "github.com"
+            and parsed.port in (None, 443)
+            and parsed.username is None
+            and parsed.password is None
+            and not parsed.query
+            and not parsed.fragment
+            and path.startswith(f"/{REPO}/releases/download/")
+            and "\\" not in path
+            and all(part not in (".", "..") for part in path.split("/"))
+        )
+    except Exception:
+        return False
+
+
+def _validate_output_prefix(prefix):
+    """输出名前缀只能是文件名片段，禁止路径分隔符、控制字符和 Windows 特殊字符。"""
+    value = str(prefix or "").strip()
+    if not value:
+        return "加水印-"
+    if any(ord(ch) < 32 for ch in value) or any(ch in value for ch in '<>:"/\\|?*'):
+        raise ValueError("输出文件名前缀包含非法字符；请勿使用路径分隔符或 Windows 特殊字符。")
+    if value.endswith((".", " ")):
+        raise ValueError("输出文件名前缀不能以空格或句点结尾。")
+    return value
 
 class NoScrollCombo(QComboBox):
     """禁止鼠标滚轮切换选项"""
@@ -147,66 +196,142 @@ _ICON_B64 = "AAABAAQAEBAAAAAAIADSAAAARgAAACAgAAAAACAAgQEAABgBAAAwMAAAAAAgADACAAC
 
 
 def _find_bin(name):
+    """查找 FFmpeg/FFprobe：优先使用程序目录中的文件，其次 third_party/ffmpeg，最后使用系统 PATH。
+
+    不再锁定特定版本或 SHA-256，方便用户替换为自己原先使用的 FFmpeg。
+    """
     exe = name + (".exe" if platform.system() == "Windows" else "")
     candidates = []
     if getattr(sys, "frozen", False):
-        # onefile: 解压到临时目录 _MEIPASS
         if hasattr(sys, "_MEIPASS"):
-            candidates.append(Path(sys._MEIPASS) / exe)
-        # onedir: exe 同目录
-        candidates.append(Path(sys.executable).parent / exe)
+            base = Path(sys._MEIPASS)
+            candidates.extend([base / exe, base / "third_party" / "ffmpeg" / exe])
+        app_dir = Path(sys.executable).parent
     else:
-        candidates.append(Path(__file__).parent / exe)
-    for p in candidates:
-        if p.exists():
-            return str(p)
-    return name  # 回退到系统 PATH
+        app_dir = Path(__file__).resolve().parent
+    candidates.extend([
+        app_dir / exe,
+        app_dir / "third_party" / "ffmpeg" / exe,
+        app_dir.parent / "third_party" / "ffmpeg" / exe,
+    ])
+    seen = set()
+    for candidate in candidates:
+        try:
+            key = str(candidate.resolve()).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            if candidate.is_file():
+                return str(candidate.resolve())
+        except OSError:
+            continue
 
+    # 本地没有时，回退到 PATH（与 1.5.2 的行为一致）。
+    import shutil
+    found = shutil.which(exe) or shutil.which(name)
+    if found:
+        return found
+    raise FileNotFoundError(
+        f"未找到 {exe}。请将 ffmpeg.exe / ffprobe.exe 放到程序目录或 third_party\\ffmpeg，"
+        f"也可以将其所在目录加入系统 PATH。"
+    )
+
+
+def detect_gpu_info():
+    """读取 Windows 图形适配器名称；仅用于界面状态展示，不参与编码器选择。"""
+    if platform.system() != "Windows":
+        return ""
+
+    commands = [
+        [
+            "powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+            "-Command",
+            "(Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name) -join \"`n\"",
+        ],
+        [
+            "wmic.exe", "path", "win32_VideoController", "get", "name",
+        ],
+    ]
+    for cmd in commands:
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=4,
+                               creationflags=NO_WINDOW)
+            if r.returncode != 0:
+                continue
+            names = []
+            for line in (r.stdout or "").splitlines():
+                name = line.strip()
+                if not name or name.lower() in {"name", "名称"}:
+                    continue
+                if name not in names:
+                    names.append(name)
+            if names:
+                return " / ".join(names[:3])
+        except Exception:
+            continue
+    return ""
 
 def detect_encoder():
-    """
-    检测可用硬件编码器。
-    第一步：查 ffmpeg -encoders 确认编码器存在。
-    第二步：用最小参数实际编码 0.1 秒验证可用。
-    RTX 50 / 新驱动 兼容。
+    """按 NVIDIA → Intel → AMD 的顺序，使用与原 1.5.2 相同的参数实际测试硬件编码器。
+
+    关键兼容点：测试输入使用 nullsrc，并显式转换为 yuv420p；部分 FFmpeg/NVENC
+    环境下，使用 color 输入或省略像素格式转换会导致 NVENC 测试失败，进而错误回退到 Intel。
     """
     ff = _find_bin("ffmpeg")
+    detect_encoder.last_errors = []
 
-    # 先拿到所有可用编码器列表
     try:
-        r = subprocess.run([ff, "-encoders"], capture_output=True,
-                           text=True, timeout=5, creationflags=NO_WINDOW)
-        encoder_list = r.stdout + r.stderr
-    except Exception:
-        encoder_list = ""
+        r = subprocess.run([ff, "-encoders"], capture_output=True, text=True,
+                           timeout=8, creationflags=NO_WINDOW)
+        encoder_list = (r.stdout or "") + (r.stderr or "")
+    except Exception as exc:
+        detect_encoder.last_errors.append(f"无法读取 FFmpeg 编码器列表：{exc}")
+        return "libx264"
 
-    candidates = []
-    if "h264_nvenc" in encoder_list:
-        candidates.append("h264_nvenc")
-    if "h264_qsv" in encoder_list:
-        candidates.append("h264_qsv")
-    if "h264_amf" in encoder_list:
-        candidates.append("h264_amf")
+    candidates = [name for name in ("h264_nvenc", "h264_qsv", "h264_amf")
+                  if name in encoder_list]
+    if not candidates:
+        detect_encoder.last_errors.append(
+            "当前 FFmpeg 未列出 h264_nvenc / h264_qsv / h264_amf。")
 
+    # 保持与已验证可识别 NVIDIA 的 1.5.2 相同的核心测试命令。
     for enc in candidates:
+        cmd = [ff,
+               "-f", "lavfi", "-i", "nullsrc=s=320x240:d=0.1",
+               "-vf", "format=yuv420p",
+               "-c:v", enc,
+               "-frames:v", "1",
+               "-f", "null", "-"]
         try:
-            # 用 nullsrc 避免 lavfi color 在某些版本上的兼容问题
-            r = subprocess.run(
-                [ff,
-                 "-f", "lavfi", "-i", "nullsrc=s=320x240:d=0.1",
-                 "-vf", "format=yuv420p",
-                 "-c:v", enc,
-                 "-frames:v", "1",
-                 "-f", "null", "-"],
-                capture_output=True, timeout=10, creationflags=NO_WINDOW)
-            # returncode 0 = 成功；同时排除 "No NVENC capable devices" 类错误
-            stderr_out = r.stderr.decode(errors="replace") if isinstance(r.stderr, bytes) else r.stderr
-            if r.returncode == 0 and "No capable" not in stderr_out and "Cannot load" not in stderr_out:
+            r = subprocess.run(cmd, capture_output=True, text=True,
+                               timeout=12, creationflags=NO_WINDOW)
+            if r.returncode == 0:
                 return enc
-        except Exception:
-            pass
+            detail = (r.stderr or r.stdout or "").strip()
+            detect_encoder.last_errors.append(
+                f"{enc} 测试失败（退出码 {r.returncode}）："
+                f"{detail[-900:] if detail else 'FFmpeg 未返回详细错误信息'}")
+        except subprocess.TimeoutExpired:
+            detect_encoder.last_errors.append(f"{enc} 初始化测试超时。")
+        except Exception as exc:
+            detect_encoder.last_errors.append(f"{enc} 测试异常：{exc}")
+
+    # 额外收集 NVIDIA 驱动信息，供界面悬停提示排查；不影响编码器选择。
+    try:
+        smi = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name,driver_version", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=4, creationflags=NO_WINDOW)
+        if smi.returncode == 0 and (smi.stdout or "").strip():
+            detect_encoder.last_errors.append("nvidia-smi：" + smi.stdout.strip()[:500])
+        elif smi.stderr and smi.stderr.strip():
+            detect_encoder.last_errors.append("nvidia-smi：" + smi.stderr.strip()[:300])
+    except Exception as exc:
+        detect_encoder.last_errors.append(
+            f"nvidia-smi 不可用（不一定代表驱动有问题）：{exc}")
 
     return "libx264"
+
+detect_encoder.last_errors = []
 
 
 def get_duration_ms(path):
@@ -255,11 +380,16 @@ class UpdateChecker(QThread):
             setup_digest = ""
             for asset in data.get("assets", []) or []:
                 name = str(asset.get("name", ""))
-                if name.lower().endswith("-setup.exe") and name.lower().startswith("video-watermark-v"):
-                    setup_url = str(asset.get("browser_download_url", "") or "")
-                    setup_name = name
+                candidate_url = str(asset.get("browser_download_url", "") or "")
+                if (
+                    name.lower().endswith("-setup.exe")
+                    and name.lower().startswith("video-watermark-v")
+                    and _is_trusted_github_asset_url(candidate_url)
+                ):
+                    setup_url = candidate_url
+                    setup_name = Path(name).name
                     digest = str(asset.get("digest", "") or "")
-                    if digest.lower().startswith("sha256:"):
+                    if re.fullmatch(r"sha256:[0-9a-fA-F]{64}", digest):
                         setup_digest = digest.split(":", 1)[1].strip().lower()
                     break
 
@@ -282,6 +412,11 @@ class UpdateDownloadWorker(QThread):
 
     def run(self):
         try:
+            if not _is_trusted_github_asset_url(self.url):
+                raise RuntimeError("更新地址不是受信任的 GitHub 官方下载地址。")
+            if not re.fullmatch(r"[0-9a-fA-F]{64}", self.expected_sha256):
+                raise RuntimeError("新版安装包缺少有效 SHA-256 校验值，已停止自动更新。")
+
             update_dir = Path(tempfile.gettempdir()) / "VideoWatermarkUpdate"
             update_dir.mkdir(parents=True, exist_ok=True)
             target = update_dir / self.filename
@@ -321,14 +456,15 @@ class UpdateDownloadWorker(QThread):
 
 
 class StartupCheckWorker(QThread):
-    """后台完成 FFmpeg / 编码器检测，避免启动阶段阻塞 Qt 主线程。"""
-    finished = pyqtSignal(bool, str, str)  # ffmpeg_ok, version, encoder
+    """后台完成 FFmpeg 完整性 / 版本 / 编码器检测，避免启动阶段阻塞 Qt 主线程。"""
+    finished = pyqtSignal(bool, str, str, str, str)  # ffmpeg_ok, version, encoder, gpu_name, error
 
     def run(self):
-        ff = _find_bin("ffmpeg")
         version = ""
         ffmpeg_ok = False
+        error = ""
         try:
+            ff = _find_bin("ffmpeg")
             r = subprocess.run(
                 [ff, "-version"], capture_output=True, text=True,
                 timeout=5, creationflags=NO_WINDOW)
@@ -337,16 +473,23 @@ class StartupCheckWorker(QThread):
                 first = (r.stdout or "").splitlines()[0] if r.stdout else ""
                 m = re.search(r"version\s+([^\s]+)", first)
                 version = m.group(1) if m else ""
-        except Exception:
-            pass
+            else:
+                error = "FFmpeg 启动失败。"
+        except Exception as exc:
+            error = str(exc)
 
         encoder = "libx264"
+        gpu_name = ""
         if ffmpeg_ok:
+            try:
+                gpu_name = detect_gpu_info()
+            except Exception:
+                gpu_name = ""
             try:
                 encoder = detect_encoder()
             except Exception:
                 encoder = "libx264"
-        self.finished.emit(ffmpeg_ok, version, encoder)
+        self.finished.emit(ffmpeg_ok, version, encoder, gpu_name, error)
 
 
 class WatermarkWorker(QThread):
@@ -369,8 +512,8 @@ class WatermarkWorker(QThread):
         self.encoder_detected.emit(encoder)
 
         p = self.params
-        # 转义水印文字
-        text = p["text"].replace("\\","\\\\").replace("'","\\'").replace(":","\\:")
+        # 安全转义用户可控的水印文字，避免 FFmpeg filtergraph / text expansion 注入。
+        text = _escape_drawtext_text(p["text"])
 
         color_hex = p["color"].lstrip("#")
         opacity   = p["opacity"] / 100.0
@@ -396,7 +539,7 @@ class WatermarkWorker(QThread):
             bg_hex = p.get("bg_color", "#000000").lstrip("#")
             bg_part = f":box=1:boxcolor=0x{bg_hex}@{op}:boxborderw=6"
 
-        vf  = (f"drawtext=text='{text}':fontfile='{font_ff}':"
+        vf  = (f"drawtext=text='{text}':expansion=none:fontfile='{font_ff}':"
                f"fontsize={fs}:fontcolor=0x{color_hex}@{op}:"
                f"x={x_expr}:y={y_expr}:"
                f"shadowcolor=black@0.45:shadowx=1:shadowy=1"
@@ -576,6 +719,141 @@ class ColorSwatch(QPushButton):
     def get(self): return self.color
 
 
+class Toast(QWidget):
+    """现代卡片式非阻塞提示：单条显示、队列串行、主题自适应。"""
+    closed = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setWindowFlags(Qt.WindowType.Widget | Qt.WindowType.FramelessWindowHint)
+
+        self.title_label = QLabel(self)
+        self.title_label.setWordWrap(True)
+        self.title_label.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
+        self.subtitle_label = QLabel(self)
+        self.subtitle_label.setWordWrap(True)
+        self.subtitle_label.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 9, 16, 9)
+        layout.setSpacing(2)
+        layout.addWidget(self.title_label)
+        layout.addWidget(self.subtitle_label)
+
+        shadow = QGraphicsDropShadowEffect(self)
+        shadow.setBlurRadius(28)
+        shadow.setOffset(0, 8)
+        self._shadow = shadow
+        self.setGraphicsEffect(shadow)
+
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self._finish)
+        self.setMinimumWidth(300)
+        self.setMaximumWidth(560)
+        self.hide()
+
+    def show_message(self, text, duration=2500, kind="info", dark=True):
+        palettes = {
+            "info": {
+                "bg": "#202a33" if dark else "#ffffff",
+                "title": "#69b7ff" if dark else "#1769aa",
+                "body": "#edf5fb" if dark else "#2f3b43",
+                "accent": "#3498db",
+                "shadow": "#000000",
+            },
+            "success": {
+                "bg": "#202c26" if dark else "#ffffff",
+                "title": "#63d39a" if dark else "#18764e",
+                "body": "#eef8f2" if dark else "#2f3934",
+                "accent": "#2d9b68",
+                "shadow": "#000000",
+            },
+            "warning": {
+                "bg": "#30291d" if dark else "#ffffff",
+                "title": "#f3bd63" if dark else "#99600b",
+                "body": "#fff7e8" if dark else "#3f372b",
+                "accent": "#d9942b",
+                "shadow": "#000000",
+            },
+            "error": {
+                "bg": "#321f20" if dark else "#ffffff",
+                "title": "#ff8585" if dark else "#b42318",
+                "body": "#fff0f0" if dark else "#402d2d",
+                "accent": "#d94b4b",
+                "shadow": "#000000",
+            },
+        }
+        pal = palettes.get(kind, palettes["info"])
+
+        # Toast 只是轻量提醒：只显示第一行标题，不展示详细正文。
+        title = str(text).split("\n", 1)[0].strip() or "提示"
+        subtitle = ""
+
+        self.title_label.setText(title)
+        self.title_label.setStyleSheet(
+            f"QLabel{{background:transparent;color:{pal['title']};font-size:13px;"
+            "font-weight:700;padding:0;margin:0;line-height:1.2;}}"
+        )
+        self.subtitle_label.setText(subtitle)
+        self.subtitle_label.setVisible(bool(subtitle))
+        self.subtitle_label.setStyleSheet(
+            f"QLabel{{background:transparent;color:{pal['body']};font-size:12px;"
+            "font-weight:400;padding:0;margin:0;line-height:1.25;}}"
+        )
+
+        self.setStyleSheet(
+            f"QWidget{{background:{pal['bg']};border:1px solid "
+            f"{'#39433e' if dark else '#e0e5e2'};border-left:5px solid {pal['accent']};"
+            "border-radius:16px;}}"
+        )
+        self._shadow.setColor(QColor(0, 0, 0, 105 if dark else 55))
+
+        parent = self.parentWidget()
+        available = parent.width() if parent else 900
+        # Toast 不宜过宽：保持截图中“右上角通知卡片”的紧凑比例，
+        # 同时给长版本号/错误信息留出足够的自动换行空间。
+        width = min(520, max(300, int(available * 0.34)))
+        if available < 600:
+            width = max(300, available - 32)
+        self.setFixedWidth(width)
+
+        # 根据内容重新计算高度。字体保持桌面应用常规字号，
+        # 长文本通过换行增加高度，而不是放大字体。
+        self.title_label.setFixedWidth(width - 36)
+        self.subtitle_label.setFixedWidth(width - 36)
+        self.title_label.adjustSize()
+        self.subtitle_label.adjustSize()
+        self.adjustSize()
+        height = max(48, min(96, self.sizeHint().height()))
+        self.setFixedHeight(height)
+        self._reposition()
+        self.raise_()
+        self.show()
+        self._timer.start(max(800, int(duration)))
+
+    def _finish(self):
+        self._timer.stop()
+        self.hide()
+        self.closed.emit()
+
+    def _reposition(self):
+        parent = self.parentWidget()
+        if not parent:
+            return
+        margin_right = 18
+        margin_top = 18
+        x = max(8, parent.width() - self.width() - margin_right)
+        y = max(8, margin_top)
+        self.setGeometry(x, y, self.width(), self.height())
+
+    def hideEvent(self, event):
+        self._timer.stop()
+        super().hideEvent(event)
+
+
 class UpdateDialog(QDialog):
     """展示更新日志，并支持在已安装版本中后台下载新版安装包。"""
     def __init__(self, parent, current_ver, latest_ver, changelog, url,
@@ -589,7 +867,7 @@ class UpdateDialog(QDialog):
         self._setup_url = setup_url
         self._setup_digest = setup_digest
         self._setup_name = setup_name
-        self._can_auto_update = bool(can_auto_update and setup_url)
+        self._can_auto_update = bool(can_auto_update and setup_url and setup_digest)
         self._parent_window = parent
         pal = PALETTE[dark]
 
@@ -665,6 +943,9 @@ class MainWindow(QMainWindow):
         self._task_done = False
         self._checking_silent = True
         self._dark = True
+        self._toast = None
+        self._toast_queue = []
+        self._toast_active = False
         self._bg_color = "#000000"     # 背景块默认颜色（随水印文字颜色自动联动）
         self._sec_labels = []          # 需要跟随主题重新着色的分区小标题
         self._div_frames = []          # 需要跟随主题重新着色的分隔线
@@ -806,6 +1087,7 @@ class MainWindow(QMainWindow):
         vl = QVBoxLayout(w); vl.setContentsMargins(20,18,20,14); vl.setSpacing(10)
         self.title_lbl = QLabel("视频批量加水印")
         self.tag_lbl = QLabel("  检测中…")
+        self.tag_lbl.hide()
 
         self.theme_btn = QPushButton("🌙  夜间")
         self.theme_btn.setFixedHeight(26)
@@ -1173,6 +1455,34 @@ class MainWindow(QMainWindow):
         for btn in self.pos_btns.values():
             btn.setEnabled(enabled)
 
+    def _show_toast(self, message, duration=2000, kind="info"):
+        """提示统一入队，保证同时触发的多个提示按顺序展示，不互相覆盖。"""
+        item = (str(message), max(500, int(duration)), kind)
+        self._toast_queue.append(item)
+
+        # 限制极端情况下的队列长度，避免异常循环导致无限增长。
+        if len(self._toast_queue) > 50:
+            del self._toast_queue[:-50]
+        self._show_next_toast()
+
+    def _show_next_toast(self):
+        if self._toast_active or not self._toast_queue:
+            return
+        if self._toast is None:
+            self._toast = Toast(self)
+            self._toast.closed.connect(self._on_toast_closed)
+        message, duration, kind = self._toast_queue.pop(0)
+        self._toast_active = True
+        self._toast.show_message(message, duration=duration, kind=kind, dark=self._dark)
+
+    def _on_toast_closed(self):
+        self._toast_active = False
+        QTimer.singleShot(0, self._show_next_toast)
+
+    def _reposition_toast(self):
+        if self._toast and self._toast.isVisible():
+            self._toast._reposition()
+
     def _refresh(self):
         n = len(self.file_rows)
         self.files_lbl.setText(f"已选文件 ({n})")
@@ -1188,7 +1498,7 @@ class MainWindow(QMainWindow):
 
         # 没有文件
         if not self.file_rows:
-            QMessageBox.information(self, "提示", "请先添加视频文件")
+            self._show_toast("请先添加视频文件", 2500, "info")
             return
 
         # 重置状态
@@ -1197,17 +1507,39 @@ class MainWindow(QMainWindow):
         self.info_lbl.setText("正在检测编码器…"); self.info_lbl.show()
 
         # 构建任务列表
-        prefix  = self.prefix_edit.text().strip() or "加水印-"
+        try:
+            prefix = _validate_output_prefix(self.prefix_edit.text())
+        except ValueError as exc:
+            self._show_toast(f"输出文件名不安全\n{exc}", 4000, "warning")
+            return
+
         out_dir = self.out_edit.text().strip()
         output_ext = self.format_cb.currentData() or ".mp4"
         tasks   = []
+        output_paths = set()
+        input_paths = {os.path.normcase(os.path.abspath(r.filepath)) for r in self.file_rows}
         for r in self.file_rows:
             p = Path(r.filepath)
             d = Path(out_dir) if out_dir else p.parent
             # MP4 输入 + MP4 输出：保持 MP4，不做额外格式转换。
             # 其他输入格式：输出统一改为用户选择的后缀，由当前 FFmpeg 处理流程完成转码。
             output_name = prefix + p.stem + output_ext
-            tasks.append({"input": str(p), "output": str(d / output_name)})
+            output_path = d / output_name
+            normalized_output = os.path.normcase(os.path.abspath(str(output_path)))
+            if normalized_output in input_paths:
+                QMessageBox.warning(
+                    self, "输出文件冲突",
+                    f"输出文件不能覆盖输入文件：\n{output_path}"
+                )
+                return
+            if normalized_output in output_paths:
+                QMessageBox.warning(
+                    self, "输出文件冲突",
+                    f"多个输入文件会写入同一个输出文件：\n{output_path}"
+                )
+                return
+            output_paths.add(normalized_output)
+            tasks.append({"input": str(p), "output": str(output_path)})
 
         # 编码器和参数
         enc_map = {0: None, 1: "h264_nvenc", 2: "h264_qsv", 3: "h264_amf", 4: "libx264"}
@@ -1229,6 +1561,7 @@ class MainWindow(QMainWindow):
         }
 
         self._done_count = 0
+        self._failed_count = 0
         self._total = len(tasks)
         self.worker = WatermarkWorker(tasks, params)
         self.worker.encoder_detected.connect(self._on_encoder)
@@ -1247,6 +1580,11 @@ class MainWindow(QMainWindow):
         label = name_map.get(enc, enc)
         color = "#27ae60" if enc != "libx264" else "#f39c12"
         self.enc_hint.setText(f"当前编码器：{label}")
+        probe_errors = getattr(detect_encoder, "last_errors", [])
+        if probe_errors:
+            self.enc_hint.setToolTip("硬件编码器自检详情：\n" + "\n".join(probe_errors))
+        elif enc == "h264_nvenc":
+            self.enc_hint.setToolTip("NVIDIA NVENC 实际编码测试通过。")
         self.enc_hint.setStyleSheet(f"font-size:11px;color:{color};")
 
     def _on_prog(self, idx, pct, speed):
@@ -1260,7 +1598,9 @@ class MainWindow(QMainWindow):
     def _on_done(self, idx, ok, msg):
         if idx < len(self.file_rows): self.file_rows[idx].set_done(ok)
         self._done_count += 1
-        if not ok: QMessageBox.warning(self,"处理失败",f"第 {idx+1} 个文件失败:\n{msg}")
+        if not ok:
+            self._failed_count += 1
+        if not ok: self._show_toast(f"第 {idx+1} 个文件处理失败：{msg}", 4000, "error")
 
     def _on_all_done(self):
         self.worker = None
@@ -1271,34 +1611,64 @@ class MainWindow(QMainWindow):
         self.start_btn.setEnabled(True)
         self.start_btn.setText(f"开始处理  ({len(self.file_rows)} 个文件)")
         self.start_btn.setStyleSheet(self._bstyle("#3498DB","#2980b9"))
-        QMessageBox.information(self, "完成", f"全部 {self._total} 个文件处理完毕！")
+        failed = self._failed_count
+        if failed:
+            self._show_toast(f"批量处理完成：成功 {self._total - failed} 个，失败 {failed} 个", 4000, "warning")
+        else:
+            self._show_toast(f"全部 {self._total} 个视频处理完成", 4000, "success")
 
     def _start_startup_checks(self):
         """启动后台环境检测；主窗口无需等待 FFmpeg 探测完成。"""
-        self.tag_lbl.setText("  ⏳  正在检测 FFmpeg…")
-        self.tag_lbl.setStyleSheet(
-            "font-size:11px;background:#2d3440;color:#f1c40f;"
-            "border-radius:10px;padding:2px 10px;")
+        self.tag_lbl.hide()
         self.start_btn.setEnabled(False)
 
         self._startup_worker = StartupCheckWorker()
         self._startup_worker.finished.connect(self._on_startup_checks_finished)
         self._startup_worker.start()
 
-    def _on_startup_checks_finished(self, ok, version, encoder):
+    def _on_startup_checks_finished(self, ok, version, encoder, gpu_name, error=""):
         if not ok:
-            self.tag_lbl.setText("  ✗  未找到 FFmpeg")
+            # 启动时先隐藏状态胶囊，失败时必须重新显示；否则用户只能看到 Toast，
+            # 左上角原有的 FFmpeg 状态胶囊会一直处于隐藏状态。
+            self.tag_lbl.setText("  ✗  未检出 FFmpeg")
             self.tag_lbl.setStyleSheet(
                 "font-size:11px;background:#3d1a1a;color:#e74c3c;"
                 "border-radius:10px;padding:2px 10px;")
+            self.tag_lbl.show()
+            self.tag_lbl.raise_()
             self.start_btn.setEnabled(False)
+            if error:
+                self._show_toast(f"FFmpeg 检测失败：{error}", 5000, "error")
+            self._startup_worker = None
             return
 
-        self.tag_lbl.setText(f"  ✓  FFmpeg {version}" if version else "  ✓  FFmpeg")
-        self.tag_lbl.setStyleSheet(
-            "font-size:11px;background:#1a3d2b;color:#27ae60;"
-            "border-radius:10px;padding:2px 10px;")
+        self.tag_lbl.hide()
         self._on_encoder(encoder)
+        # 启动时只提醒 FFmpeg 和实际检测到的 GPU；编码器名称保留在主界面状态文字中，
+        # 不再单独弹 Toast，避免启动阶段连续弹出过多通知。
+        self._show_toast("✓ FFmpeg 检测正常", 1800, "success")
+        if encoder in ("h264_nvenc", "h264_qsv", "h264_amf"):
+            # GPU 名称与硬件编码器分开检测，再按实际编码器选择对应显卡，
+            # 避免机器同时存在核显+独显时把“第一块显卡”误报成当前加速设备。
+            vendor_map = {
+                "h264_nvenc": ("NVIDIA", "NVIDIA GPU 加速"),
+                "h264_qsv": ("Intel", "Intel GPU 加速"),
+                "h264_amf": ("AMD", "AMD GPU 加速"),
+            }
+            vendor, gpu_title = vendor_map[encoder]
+            selected_gpu = ""
+            for item in str(gpu_name or "").split(" / "):
+                if vendor.lower() in item.lower():
+                    selected_gpu = item.strip()
+                    break
+            self._show_toast(f"⚡ {gpu_title}", 1800, "success")
+            if selected_gpu:
+                self.enc_hint.setToolTip(f"当前加速设备：{selected_gpu}")
+        elif gpu_name:
+            self._show_toast("⚠ 已检测到 GPU，但硬件编码不可用", 2200, "warning")
+            self.enc_hint.setToolTip(f"检测到：{gpu_name}")
+        else:
+            self._show_toast("⚠ 未检测到可用 GPU 加速", 2200, "warning")
         self.start_btn.setEnabled(True)
         self._startup_worker = None
 
@@ -1349,21 +1719,68 @@ class MainWindow(QMainWindow):
         self.update_btn.setEnabled(True); silent = self._checking_silent
         MainWindow._update_url=url; MainWindow._setup_url=setup_url; MainWindow._setup_name=setup_name; MainWindow._setup_digest=setup_digest
         MainWindow._latest_ver=latest; MainWindow._latest_body=body
-        if latest and latest != APP_VERSION:
+        current_semver = _parse_semver(APP_VERSION)
+        latest_semver = _parse_semver(latest)
+        if latest_semver and current_semver and latest_semver > current_semver:
             self.update_btn.setText("有可用更新")
             self.update_btn.setStyleSheet("QPushButton{background:#e67e22;border:none;border-radius:11px;color:#fff;font-size:11px;font-weight:600;padding:0 12px;}QPushButton:hover{background:#d35400;}QPushButton:pressed{background:#b94600;}")
-            self.update_btn.setToolTip(f"新版本 {latest} 可用，点击后可后台下载并直接更新" if setup_url and self._is_installed_build() else f"新版本 {latest} 可用，点击查看下载页")
-            if not silent: self._show_update_dialog(latest,url,body,setup_url,setup_digest,setup_name)
+            auto_ok = bool(setup_url and setup_digest and self._is_installed_build())
+            self.update_btn.setToolTip(f"新版本 {latest} 可用，点击后可后台下载并直接更新" if auto_ok else f"新版本 {latest} 可用，点击查看下载页")
+            self._show_toast(f"发现新版本 {latest} · 点击左下角「有可用更新」查看", 2000, "info")
         else:
             self.update_btn.setText("当前最新版 ✓")
             self.update_btn.setStyleSheet("QPushButton{background:transparent;border:1px solid #27ae60;border-radius:11px;color:#27ae60;font-size:11px;padding:0 10px;}QPushButton:hover{background:rgba(39,174,96,0.1);}")
             self.update_btn.setToolTip("")
-            if not silent: QMessageBox.information(self,"检测更新",f"当前已是最新版本  {APP_VERSION} 🎉")
+            self._show_toast(f"当前已是最新版本 {APP_VERSION}", 2000, "success")
 
     def _on_update_error(self, msg):
-        self.update_btn.setEnabled(True); silent=self._checking_silent
-        self.update_btn.setText("检测更新"); self.update_btn.setStyleSheet(self._btn_style_default()); self.update_btn.setToolTip("")
-        if not silent: QMessageBox.warning(self,"检测失败","无法连接更新服务器，请检查网络连接。")
+        self.update_btn.setEnabled(True)
+        silent = self._checking_silent
+        raw = str(msg or "未知错误").strip()
+        lower = raw.lower()
+
+        # 将常见网络/API 错误翻译成可操作的提示，同时保留原始错误便于排查。
+        if isinstance(getattr(self, "_last_update_exception", None), TimeoutError) or "timed out" in lower or "timeout" in lower:
+            reason = "连接 GitHub 超时，网络可能不稳定或当前网络无法访问 GitHub。"
+            advice = "请检查网络或代理设置后重试。"
+        elif "urlerror" in lower or "name or service not known" in lower or "getaddrinfo failed" in lower or "11001" in lower or "nodename nor servname" in lower:
+            reason = "无法连接 GitHub，可能是网络连接或 DNS 解析问题。"
+            advice = "请确认可以正常打开 github.com，并检查网络、DNS 或代理设置。"
+        elif "404" in lower or "not found" in lower:
+            reason = "GitHub 更新仓库或最新 Release 不存在（HTTP 404）。"
+            advice = "请检查程序中的仓库地址是否正确，以及 GitHub 上是否已发布正式版本。"
+        elif "403" in lower or "rate limit" in lower:
+            reason = "GitHub 暂时限制了更新查询请求（HTTP 403）。"
+            advice = "请稍等一段时间后重试，或打开项目的 Releases 页面手动查看。"
+        elif "ssl" in lower or "certificate" in lower or "cert_verify_failed" in lower:
+            reason = "与 GitHub 建立安全连接失败，可能与系统证书、代理或 HTTPS 检查有关。"
+            advice = "请检查系统日期时间、证书和代理设置。"
+        elif "json" in lower or "decode" in lower:
+            reason = "GitHub 返回的数据无法识别，可能是网络代理拦截或接口响应异常。"
+            advice = "请稍后重试，或打开项目的 Releases 页面确认发布信息。"
+        else:
+            reason = "暂时无法获取 GitHub 的最新版本信息。"
+            advice = "请检查网络后重试；也可以打开项目的 Releases 页面手动检查更新。"
+
+        self.update_btn.setText("检测更新")
+        self.update_btn.setStyleSheet(self._btn_style_default())
+        detail = f"{reason}\n建议：{advice}\n原始错误：{raw}"
+        self.update_btn.setToolTip(detail)
+
+        if silent:
+            self._show_toast(f"自动检查更新失败：{reason} 鼠标悬停在「检测更新」上可查看详情。", 6000, "warning")
+        else:
+            # 检测失败时提供直达 Releases 页面的按钮，便于绕过 GitHub API 限流手动查看。
+            dialog = QMessageBox(self)
+            dialog.setIcon(QMessageBox.Icon.Warning)
+            dialog.setWindowTitle("版本检测失败")
+            dialog.setText(f"{reason}\n\n{advice}\n\n详细错误信息：\n{raw}")
+            releases_button = dialog.addButton("前往 Releases", QMessageBox.ButtonRole.ActionRole)
+            dialog.addButton(QMessageBox.StandardButton.Ok)
+            dialog.setDefaultButton(QMessageBox.StandardButton.Ok)
+            dialog.exec()
+            if dialog.clickedButton() is releases_button:
+                QDesktopServices.openUrl(QUrl(RELEASES_URL))
 
     def _show_update_dialog(self, latest, url, body="", setup_url="", setup_digest="", setup_name=""):
         dlg=UpdateDialog(self,APP_VERSION,latest,body,url,setup_url=setup_url,setup_digest=setup_digest,setup_name=setup_name,can_auto_update=self._is_installed_build(),dark=self._dark)
@@ -1445,6 +1862,10 @@ class MainWindow(QMainWindow):
             self._dark = dark
             self._apply_theme()
 
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._reposition_toast()
+
     def closeEvent(self, e):
         self._save_settings()
         if self.worker and self.worker.isRunning():
@@ -1455,51 +1876,59 @@ class MainWindow(QMainWindow):
         e.accept()
 
 
-def create_splash():
-    """创建启动画面"""
-    w, h = 360, 220
+def create_splash(dark=True):
+    """创建跟随已保存主题的启动画面。"""
+    w, h = 440, 260
     pix = QPixmap(w, h)
     pix.fill(Qt.GlobalColor.transparent)
 
     p = QPainter(pix)
     p.setRenderHint(QPainter.RenderHint.Antialiasing)
 
-    # 深色圆角背景
+    # 根据上次保存的主题选择启动画面配色，避免主界面切换主题后启动画面仍固定深色。
     from PyQt6.QtGui import QBrush, QPen, QColor as QC
     from PyQt6.QtCore import QRectF
-    p.setBrush(QBrush(QC("#1a2035")))
-    p.setPen(QPen(QC("#2a3a5a"), 1))
+    bg = "#1a2035" if dark else "#f7f8fa"
+    border = "#2a3a5a" if dark else "#d8dde5"
+    title_color = "#ffffff" if dark else "#1f2937"
+    sub_color = "#7f9ac4" if dark else "#667085"
+    version_color = "#3498DB" if dark else "#1677c8"
+    track_color = "#1e2d45" if dark else "#dfe5ec"
+    hint_color = "#7b8aa6" if dark else "#98a2b3"
+    progress_color = "#3498DB"
+    p.setBrush(QBrush(QC(bg)))
+    p.setPen(QPen(QC(border), 1))
     p.drawRoundedRect(QRectF(1, 1, w-2, h-2), 14, 14)
 
     # 软件名
-    f_title = QFont("Microsoft YaHei", 16, QFont.Weight.Bold)
+    f_title = QFont("Microsoft YaHei", 22, QFont.Weight.Bold)
     p.setFont(f_title)
-    p.setPen(QC("#ffffff"))
-    p.drawText(QRectF(0, 68, w, 36), Qt.AlignmentFlag.AlignHCenter, "视频批量加水印")
+    p.setPen(QC(title_color))
+    p.drawText(QRectF(12, 70, w-24, 44), Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter, "视频批量加水印")
 
     # 英文副标题
-    f_sub = QFont("Segoe UI", 10)
+    f_sub = QFont("Segoe UI", 12)
     p.setFont(f_sub)
-    p.setPen(QC("#5a7aaa"))
-    p.drawText(QRectF(0, 102, w, 24), Qt.AlignmentFlag.AlignHCenter, "Video Watermark Tool")
+    p.setPen(QC(sub_color))
+    p.drawText(QRectF(0, 118, w, 28), Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter, "Video Watermark Tool")
 
     # 版本号
-    f_ver = QFont("Segoe UI", 9)
+    f_ver = QFont("Segoe UI", 11, QFont.Weight.DemiBold)
     p.setFont(f_ver)
-    p.setPen(QC("#3498DB"))
-    p.drawText(QRectF(0, 130, w, 20), Qt.AlignmentFlag.AlignHCenter, APP_VERSION)
+    p.setPen(QC(version_color))
+    p.drawText(QRectF(0, 148, w, 24), Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter, APP_VERSION)
 
     # 进度条背景
-    bar_x, bar_y, bar_w, bar_h = (w-160)//2, 162, 160, 3
-    p.setBrush(QBrush(QC("#1e2d45")))
+    bar_x, bar_y, bar_w, bar_h = (w-190)//2, 184, 190, 4
+    p.setBrush(QBrush(QC(track_color)))
     p.setPen(Qt.PenStyle.NoPen)
     p.drawRoundedRect(QRectF(bar_x, bar_y, bar_w, bar_h), 2, 2)
 
     # 提示文字
-    f_hint = QFont("Microsoft YaHei", 8)
+    f_hint = QFont("Microsoft YaHei", 10)
     p.setFont(f_hint)
-    p.setPen(QC("#2a3a5a"))
-    p.drawText(QRectF(0, 174, w, 20), Qt.AlignmentFlag.AlignHCenter, "正在加载…")
+    p.setPen(QC(hint_color))
+    p.drawText(QRectF(0, 198, w, 26), Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter, "正在加载…")
 
     p.end()
     return pix, (bar_x, bar_y, bar_w, bar_h)
@@ -1510,9 +1939,17 @@ if __name__ == "__main__":
     app.setApplicationName("视频批量加水印")
     app.setApplicationVersion(APP_VERSION)
 
+    # 启动画面跟随上次保存的主题；若尚无设置则默认深色。
+    _settings = QSettings("VideoWatermark", "Settings")
+    _saved_dark = _settings.value("dark_theme", True)
+    if isinstance(_saved_dark, str):
+        splash_dark = _saved_dark.strip().lower() not in ("false", "0", "no", "off")
+    else:
+        splash_dark = bool(_saved_dark)
+
     # 启动画面：先显示，再异步创建主窗口。这样打包后的 EXE 即使初始化较慢，
     # 用户也会立即看到反馈，而不是面对长时间空白。
-    splash_pix, bar_info = create_splash()
+    splash_pix, bar_info = create_splash(splash_dark)
     splash = QSplashScreen(splash_pix, Qt.WindowType.WindowStaysOnTopHint)
     splash.setWindowFlag(Qt.WindowType.FramelessWindowHint)
     splash.show()
@@ -1527,7 +1964,8 @@ if __name__ == "__main__":
         cur_w = int(bar_w * pct)
         p2 = QPainter(splash_pix)
         p2.setRenderHint(QPainter.RenderHint.Antialiasing)
-        p2.setBrush(QBrush(QC("#1e2d45")))
+        track_color = "#1e2d45" if splash_dark else "#dfe5ec"
+        p2.setBrush(QBrush(QC(track_color)))
         p2.setPen(Qt.PenStyle.NoPen)
         p2.drawRoundedRect(QRectF(bar_x, bar_y, bar_w, bar_h), 2, 2)
         if cur_w > 0:
