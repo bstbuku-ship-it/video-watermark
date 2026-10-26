@@ -5,12 +5,12 @@
 运行: pythonw video_watermark.py
 """
 
-APP_VERSION  = "v1.5.3"
+APP_VERSION  = "v1.5.4"
 REPO         = "bstbuku-ship-it/video-watermark"
 RELEASES_URL = f"https://github.com/{REPO}/releases/latest"
 API_URL      = f"https://api.github.com/repos/{REPO}/releases/latest"
 
-import sys, os, subprocess, platform, re, base64, tempfile, hashlib
+import sys, os, subprocess, platform, re, base64, tempfile, hashlib, time
 import urllib.request, urllib.error, urllib.parse, json
 from PyQt6.QtCore import QSettings, QUrl
 from pathlib import Path
@@ -96,11 +96,115 @@ class NoScrollSlider(QSlider):
     def wheelEvent(self, e): e.ignore()
 
 
+# 字体下拉框采用中文说明；括号保留原字体名，方便识别与排查。
+# 新增的三款字体来自 Google Fonts，采用 SIL Open Font License。
 FONTS = {
-    "Arial":    "C:/Windows/Fonts/arial.ttf",
-    "Segoe UI": "C:/Windows/Fonts/segoeui.ttf",
-    "Calibri":  "C:/Windows/Fonts/calibri.ttf",
+    "通用无衬线（Arial）":       "C:/Windows/Fonts/arial.ttf",
+    "微软界面字体（Segoe UI）": "C:/Windows/Fonts/segoeui.ttf",
+    "办公风格（Calibri）":       "C:/Windows/Fonts/calibri.ttf",
+    "现代简洁（Roboto）":        "",
+    "清晰易读（Open Sans）":     "",
+    "醒目标题（Montserrat）":    "",
 }
+
+LEGACY_FONT_LABELS = {
+    "Arial": "通用无衬线（Arial）",
+    "Segoe UI": "微软界面字体（Segoe UI）",
+    "Calibri": "办公风格（Calibri）",
+}
+
+FONT_DOWNLOADS = {
+    "现代简洁（Roboto）": (
+        "Roboto[wdth,wght].ttf",
+        "https://raw.githubusercontent.com/google/fonts/main/ofl/roboto/Roboto%5Bwdth,wght%5D.ttf",
+        "https://raw.githubusercontent.com/google/fonts/main/ofl/roboto/OFL.txt",
+    ),
+    "清晰易读（Open Sans）": (
+        "OpenSans[wdth,wght].ttf",
+        "https://raw.githubusercontent.com/google/fonts/main/ofl/opensans/OpenSans%5Bwdth,wght%5D.ttf",
+        "https://raw.githubusercontent.com/google/fonts/main/ofl/opensans/OFL.txt",
+    ),
+    "醒目标题（Montserrat）": (
+        "Montserrat[wght].ttf",
+        "https://raw.githubusercontent.com/google/fonts/main/ofl/montserrat/Montserrat%5Bwght%5D.ttf",
+        "https://raw.githubusercontent.com/google/fonts/main/ofl/montserrat/OFL.txt",
+    ),
+}
+
+
+def _font_cache_dir():
+    '将按需下载的开放字体放到用户目录，避免写入安装目录需要管理员权限。'
+    root = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
+    base = Path(root) / "VideoWatermark" / "fonts" if root else Path.home() / ".video_watermark" / "fonts"
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+
+def _download_open_font(url, destination, max_bytes=18 * 1024 * 1024):
+    '仅从 Google Fonts 官方 GitHub 原始文件域下载字体，限制大小并校验字体文件头。'
+    parsed = urllib.parse.urlparse(str(url))
+    if (parsed.scheme != "https" or parsed.hostname != "raw.githubusercontent.com"
+            or not parsed.path.startswith("/google/fonts/main/ofl/")):
+        raise RuntimeError("字体下载地址不是受信任的 Google Fonts 官方文件地址。")
+    req = urllib.request.Request(url, headers={"User-Agent": "video-watermark-font-loader"})
+    temp = destination.with_suffix(destination.suffix + ".download")
+    try:
+        total = 0
+        with urllib.request.urlopen(req, timeout=25) as response, open(temp, "wb") as out:
+            while True:
+                chunk = response.read(256 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_bytes:
+                    raise RuntimeError("字体文件大小超出允许范围，已取消下载。")
+                out.write(chunk)
+        with open(temp, "rb") as f:
+            signature = f.read(4)
+        if signature not in (b"\x00\x01\x00\x00", b"OTTO", b"true", b"ttcf"):
+            raise RuntimeError("下载内容不是有效的 TTF/OTF 字体文件。")
+        os.replace(str(temp), str(destination))
+    finally:
+        try:
+            temp.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def _resolve_font_file(font_name):
+    '解析水印字体路径；新增免费字体在首次使用时从官方源下载并缓存。'
+    font_name = LEGACY_FONT_LABELS.get(str(font_name or ""), str(font_name or ""))
+    static_path = FONTS.get(font_name)
+    if static_path:
+        path = Path(static_path)
+        if path.is_file():
+            return str(path.resolve())
+        win_fonts = Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts"
+        candidate = win_fonts / Path(static_path).name
+        if candidate.is_file():
+            return str(candidate.resolve())
+        raise FileNotFoundError(f"找不到字体文件：{font_name}（{Path(static_path).name}）。")
+
+    spec = FONT_DOWNLOADS.get(font_name)
+    if spec:
+        filename, font_url, license_url = spec
+        cache = _font_cache_dir()
+        dest = cache / filename
+        if not dest.is_file():
+            _download_open_font(font_url, dest)
+        # 一并保存 OFL 许可文本；许可下载失败不影响已下载字体使用。
+        license_path = cache / (Path(filename).stem + "-OFL.txt")
+        if not license_path.is_file():
+            try:
+                req = urllib.request.Request(license_url, headers={"User-Agent": "video-watermark-font-loader"})
+                with urllib.request.urlopen(req, timeout=10) as response:
+                    license_text = response.read(512 * 1024).decode("utf-8", errors="replace")
+                license_path.write_text(license_text, encoding="utf-8")
+            except Exception:
+                pass
+        return str(dest.resolve())
+    raise FileNotFoundError(f"未知水印字体：{font_name}")
+
 
 ENCODER_PROFILES = {
     "h264_nvenc": {
@@ -359,6 +463,37 @@ def parse_speed(line):
     return m.group(1) if m else None
 
 
+def build_drawtext_filter(params):
+    "正式输出与预览共用完全相同的水印滤镜，保持字号、位置、边距和描边比例一致。"
+    text = _escape_drawtext_text(params.get("text", ""))
+    color_hex = str(params.get("color", "#FFFFFF")).lstrip("#")
+    opacity = max(0.0, min(1.0, float(params.get("opacity", 100)) / 100.0))
+    margin = max(0, int(params.get("margin", 10)))
+    position = params.get("position", "左上角")
+    x_expr, y_expr = POSITIONS.get(position, POSITIONS["左上角"])(margin)
+    font_file = _resolve_font_file(params.get("font", "通用无衬线（Arial）"))
+    # FFmpeg filtergraph 中 Windows 盘符冒号必须转义；统一使用正斜杠减少路径解析歧义。
+    font_ff = font_file.replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
+    font_size = max(1, int(params.get("font_size", 20)))
+    opacity_text = f"{opacity:.2f}"
+
+    border_part = ""
+    if params.get("border_on"):
+        border_width = max(0, int(params.get("border_w", 2)))
+        border_part = f":borderw={border_width}:bordercolor=0x000000@0.75"
+
+    bg_part = ""
+    if params.get("bg_on"):
+        bg_hex = str(params.get("bg_color", "#000000")).lstrip("#")
+        bg_part = f":box=1:boxcolor=0x{bg_hex}@{opacity_text}:boxborderw=6"
+
+    drawtext = (f"drawtext=text='{text}':expansion=none:fontfile='{font_ff}':"
+                f"fontsize={font_size}:fontcolor=0x{color_hex}@{opacity_text}:"
+                f"x={x_expr}:y={y_expr}:"
+                f"shadowcolor=black@0.45:shadowx=1:shadowy=1"
+                + border_part + bg_part)
+    return drawtext
+
 class UpdateChecker(QThread):
     # tag, release page, changelog, setup asset url, asset name, sha256 digest
     result = pyqtSignal(str, str, str, str, str, str)
@@ -497,6 +632,7 @@ class WatermarkWorker(QThread):
     file_done        = pyqtSignal(int, bool, str)
     all_done         = pyqtSignal()
     encoder_detected = pyqtSignal(str)
+    fatal_error      = pyqtSignal(str)
 
     def __init__(self, tasks, params):
         super().__init__()
@@ -512,38 +648,15 @@ class WatermarkWorker(QThread):
         self.encoder_detected.emit(encoder)
 
         p = self.params
-        # 安全转义用户可控的水印文字，避免 FFmpeg filtergraph / text expansion 注入。
-        text = _escape_drawtext_text(p["text"])
-
-        color_hex = p["color"].lstrip("#")
-        opacity   = p["opacity"] / 100.0
-        margin    = p["margin"]
-        x_expr, y_expr = POSITIONS[p["position"]](margin)
-        enc_args  = ENCODER_PROFILES[encoder][p["quality"]]
-
-        # 字体文件路径（FFmpeg drawtext 冒号需转义）
-        font_file = FONTS.get(p["font"], "C:/Windows/Fonts/arial.ttf")
-        font_ff   = font_file.replace(":", "\\:")
-        fs  = str(p["font_size"])
-        op  = f"{opacity:.2f}"
-
-        # 描边参数
-        border_part = ""
-        if p.get("border_on"):
-            bw = p.get("border_w", 2)
-            border_part = f":borderw={bw}:bordercolor=0x000000@0.75"
-
-        # 背景块参数（颜色可选白/黑，透明度与水印文字透明度一致）
-        bg_part = ""
-        if p.get("bg_on"):
-            bg_hex = p.get("bg_color", "#000000").lstrip("#")
-            bg_part = f":box=1:boxcolor=0x{bg_hex}@{op}:boxborderw=6"
-
-        vf  = (f"drawtext=text='{text}':expansion=none:fontfile='{font_ff}':"
-               f"fontsize={fs}:fontcolor=0x{color_hex}@{op}:"
-               f"x={x_expr}:y={y_expr}:"
-               f"shadowcolor=black@0.45:shadowx=1:shadowy=1"
-               + border_part + bg_part)
+        try:
+            enc_args = ENCODER_PROFILES[encoder][p["quality"]]
+            # 预览与实际输出使用同一滤镜生成函数，避免样式参数出现偏差。
+            vf = build_drawtext_filter(p)
+        except Exception as exc:
+            # 新增字体首次使用时需要下载；若网络或字体加载失败，明确报告并正常恢复界面。
+            self.fatal_error.emit(f"无法加载水印字体或生成水印滤镜：{exc}")
+            self.all_done.emit()
+            return
         for idx, task in enumerate(self.tasks):
             if self._stop: break
             inp, out = task["input"], task["output"]
@@ -929,6 +1042,297 @@ class UpdateDialog(QDialog):
         webbrowser.open(self._url); self.accept()
 
 
+class PreviewFrameWorker(QThread):
+    """后台抽取带水印的静态预览帧，防止读取大视频时卡住主界面。"""
+    result = pyqtSignal(str, bytes, str)
+
+    def __init__(self, filepath, params, timestamp=1):
+        super().__init__()
+        self.filepath = str(filepath)
+        self.params = dict(params)
+        self.timestamp = max(0, float(timestamp))
+        self._process = None
+
+    def stop(self):
+        """关闭预览窗口时终止正在运行的 FFmpeg 子进程。"""
+        self.requestInterruption()
+        proc = self._process
+        if proc is not None:
+            try:
+                if proc.poll() is None:
+                    proc.kill()
+            except Exception:
+                pass
+
+    def run(self):
+        try:
+            ff = _find_bin("ffmpeg")
+            vf = build_drawtext_filter(self.params)
+            attempts = [self.timestamp]
+            if self.timestamp > 0:
+                attempts.append(0.0)
+            last_error = "未能从该视频提取画面。"
+            for seek in attempts:
+                if self.isInterruptionRequested():
+                    return
+                cmd = [
+                    ff, "-hide_banner", "-loglevel", "error", "-ss", f"{seek:g}",
+                    "-i", self.filepath, "-frames:v", "1", "-an",
+                    "-vf", vf,
+                    "-q:v", "2", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1"
+                ]
+                proc = subprocess.Popen(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    creationflags=NO_WINDOW
+                )
+                self._process = proc
+                try:
+                    stdout, stderr = proc.communicate(timeout=10)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    stdout, stderr = proc.communicate()
+                    self._process = None
+                    last_error = "预览取帧超时，请尝试较短的视频或检查 FFmpeg。"
+                    break
+                finally:
+                    self._process = None
+                if self.isInterruptionRequested():
+                    return
+                if proc.returncode == 0 and stdout:
+                    self.result.emit(self.filepath, stdout, "")
+                    return
+                detail = (stderr or b"").decode("utf-8", errors="replace").strip()
+                if detail:
+                    last_error = detail[-700:]
+            if not self.isInterruptionRequested():
+                self.result.emit(self.filepath, b"", last_error)
+        except Exception as exc:
+            if not self.isInterruptionRequested():
+                self.result.emit(self.filepath, b"", str(exc))
+
+
+class PreviewDialog(QDialog):
+    """多视频静态预览；胶囊按钮切换整体/局部显示，不播放视频。"""
+    def __init__(self, parent, files, params, timestamp=1, dark=True):
+        super().__init__(parent)
+        self.setWindowTitle("水印效果预览")
+        self.resize(900, 650)
+        self.setMinimumSize(720, 500)
+        self._files = list(files)
+        self._params = dict(params)
+        self._timestamp = max(0, float(timestamp))
+        self._dark = dark
+        self._worker = None
+        self._requested_path = ""
+        self._closing = False
+        pal = PALETTE[dark]
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(18, 16, 18, 16)
+        root.setSpacing(10)
+
+        controls = QHBoxLayout()
+        controls.addWidget(QLabel("预览视频"))
+        self.file_cb = QComboBox()
+        self.file_cb.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        for path in self._files:
+            self.file_cb.addItem(Path(path).name, path)
+        self.file_cb.currentIndexChanged.connect(self._on_file_changed)
+        controls.addWidget(self.file_cb, 1)
+        self.prev_btn = QPushButton("上一条")
+        self.next_btn = QPushButton("下一条")
+        self.prev_btn.clicked.connect(lambda: self.file_cb.setCurrentIndex(max(0, self.file_cb.currentIndex() - 1)))
+        self.next_btn.clicked.connect(lambda: self.file_cb.setCurrentIndex(min(self.file_cb.count() - 1, self.file_cb.currentIndex() + 1)))
+        controls.addWidget(self.prev_btn)
+        controls.addWidget(self.next_btn)
+
+        # 单个胶囊按钮切换预览方式，默认整体预览，减少界面占用。
+        # 局部模式只裁剪显示区域，水印坐标始终来自正式输出共用的滤镜。
+        self._view_mode = "overall"
+        self.view_mode_btn = QPushButton("整体预览")
+        self.view_mode_btn.setFixedSize(116, 32)
+        self.view_mode_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.view_mode_btn.setToolTip("点击切换整体预览 / 水印局部预览；不会更改实际输出。")
+        self.view_mode_btn.setStyleSheet(
+            "QPushButton{background:#263747;color:#8ecbff;border:1px solid #3498DB;"
+            "border-radius:16px;padding:3px 12px;font-size:12px;font-weight:600;}"
+            "QPushButton:hover{background:#30495d;}"
+        )
+        self.view_mode_btn.clicked.connect(self._toggle_view_mode)
+        controls.addWidget(self.view_mode_btn)
+        root.addLayout(controls)
+
+        self.image_label = QLabel("正在生成静态预览…")
+        self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.image_label.setMinimumSize(620, 360)
+        self.image_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.image_label.setStyleSheet(
+            f"QLabel{{background:{'#171717' if dark else '#ffffff'};border:1px solid {pal['border']};"
+            f"border-radius:8px;color:{pal['text_muted']};padding:0px;margin:0px;}}"
+        )
+        root.addWidget(self.image_label, 1)
+
+        self.status_lbl = QLabel("预览为静态画面，不播放视频。")
+        self.status_lbl.setStyleSheet(f"font-size:11px;color:{pal['text_muted']};")
+        root.addWidget(self.status_lbl)
+
+        bottom = QHBoxLayout()
+        bottom.addStretch()
+        self.refresh_btn = QPushButton("重新生成")
+        close_btn = QPushButton("关闭")
+        self.refresh_btn.clicked.connect(self._load_current)
+        close_btn.clicked.connect(self.accept)
+        self.refresh_btn.setFixedHeight(32)
+        close_btn.setFixedHeight(32)
+        bottom.addWidget(self.refresh_btn)
+        bottom.addWidget(close_btn)
+        root.addLayout(bottom)
+        self.setStyleSheet(f"QDialog{{background:{pal['panel_bg']};}} QLabel{{background:transparent;}}")
+
+        if self._files:
+            self._load_current()
+
+    def _toggle_view_mode(self):
+        self._view_mode = "local" if self._view_mode == "overall" else "overall"
+        self.view_mode_btn.setText("局部预览" if self._view_mode == "local" else "整体预览")
+        self.view_mode_btn.setToolTip(
+            "点击切换为整体预览" if self._view_mode == "local" else "点击切换为水印局部预览"
+        )
+        self._fit_pixmap()
+
+    def _on_file_changed(self, _index):
+        self.prev_btn.setEnabled(self.file_cb.currentIndex() > 0)
+        self.next_btn.setEnabled(self.file_cb.currentIndex() < self.file_cb.count() - 1)
+        self._load_current()
+
+    def _load_current(self):
+        path = self.file_cb.currentData()
+        if not path:
+            self.image_label.setText("没有可预览的视频。")
+            return
+        self._requested_path = str(path)
+        self._source_pixmap = None
+        self.prev_btn.setEnabled(self.file_cb.currentIndex() > 0)
+        self.next_btn.setEnabled(self.file_cb.currentIndex() < self.file_cb.count() - 1)
+        self.image_label.clear()
+        self.image_label.setText("正在生成带水印的静态画面…")
+        self.status_lbl.setText(f"正在读取：{Path(path).name}")
+        if self._worker and self._worker.isRunning():
+            # 不并发启动多个 FFmpeg：当前读取完成后会自动为最新选中的视频重新取帧。
+            return
+        self._start_worker(path)
+
+    def _start_worker(self, path):
+        worker = PreviewFrameWorker(path, self._params, self._timestamp)
+        self._worker = worker
+        worker.result.connect(self._on_frame_result)
+        worker.finished.connect(lambda w=worker: self._on_worker_finished(w))
+        worker.start()
+
+    def _on_frame_result(self, path, data, error):
+        if self._closing or str(path) != str(self.file_cb.currentData()):
+            return
+        if data:
+            pix = QPixmap()
+            if pix.loadFromData(data):
+                self._source_pixmap = pix
+                self._fit_pixmap()
+                mode = self._view_mode
+                mode_note = (
+                    "当前为水印角落局部放大，仅用于看清文字样式；切换到整体预览可核对整张画面中的实际位置。"
+                    if mode == "local" else
+                    "整体画面：水印位置、字号和边距均按正式输出的原始分辨率计算。"
+                )
+                self.status_lbl.setText(
+                    f"预览：{Path(path).name} · 源画面 {pix.width()}×{pix.height()} · {mode_note}"
+                )
+            else:
+                self.image_label.setText("预览图片解码失败。")
+                self.status_lbl.setText("请检查 FFmpeg 输出或尝试重新生成。")
+        else:
+            self.image_label.setText("无法生成预览画面。")
+            self.status_lbl.setText(f"错误：{error}")
+
+    def _on_worker_finished(self, worker):
+        if self._worker is worker:
+            self._worker = None
+        wanted = str(self.file_cb.currentData() or "")
+        if not self._closing and wanted and wanted != str(worker.filepath):
+            QTimer.singleShot(0, lambda p=wanted: self._start_worker(p) if p == str(self.file_cb.currentData() or "") else None)
+        worker.deleteLater()
+
+    def _fit_pixmap(self):
+        """整体模式显示完整帧；局部模式放大显示水印所在角落的裁剪区域。
+
+        水印始终先按正式输出相同的 FFmpeg 滤镜绘制到原始分辨率帧上，
+        局部模式只裁剪已生成的预览图，因此不会改变实际水印的坐标、字号或边距。
+        """
+        pix = getattr(self, "_source_pixmap", None)
+        if not pix or pix.isNull():
+            return
+
+        display_pix = pix
+        if self._view_mode == "local":
+            width, height = pix.width(), pix.height()
+            position = str(self._params.get("position", "左上角"))
+            text = str(self._params.get("text", ""))
+            font_size = max(1, int(self._params.get("font_size", 20)))
+            margin = max(0, int(self._params.get("margin", 10)))
+
+            # 估算水印所需宽度，以便长文字/大字号时扩大局部区域，尽量避免裁掉文字。
+            # 估算只决定预览裁剪窗口，不参与正式 FFmpeg 滤镜。
+            estimated_text_width = sum(
+                font_size * (1.0 if ord(ch) > 0x2E80 else 0.62) for ch in text
+            )
+            estimated_fraction = (estimated_text_width + margin * 2 + font_size * 0.8) / max(1, width)
+            crop_fraction = max(0.58, min(0.97, estimated_fraction + 0.06))
+            crop_w = max(1, min(width, int(width * crop_fraction)))
+            crop_h = max(1, min(height, int(height * crop_fraction)))
+
+            x = width - crop_w if "右" in position else 0
+            y = height - crop_h if "下" in position else 0
+            display_pix = pix.copy(x, y, crop_w, crop_h)
+            if display_pix.isNull():
+                display_pix = pix
+
+        # 关键修复：按 QLabel 真正可绘制的内容区域缩放，不使用 QWidget 外框尺寸。
+        # 之前按 image_label.size() 缩放、但控件样式另有 padding，边缘水印会被控件裁掉；
+        # 10px 源画面边距缩小后只有少量显示像素，最容易误判为水印跑到画面外。
+        target_size = self.image_label.contentsRect().size()
+        if target_size.width() < 2 or target_size.height() < 2:
+            target_size = self.image_label.size()
+        scaled_pix = display_pix.scaled(
+            target_size, Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation
+        )
+        self.image_label.setPixmap(scaled_pix)
+
+        if hasattr(self, "status_lbl") and self._source_pixmap is not None:
+            path = self.file_cb.currentData()
+            if self._view_mode == "local":
+                self.status_lbl.setText(
+                    f"局部预览：{Path(str(path)).name} · 放大显示“{self._params.get('position', '左上角')}”区域；"
+                    "切换“整体预览”可检查水印在整张视频中的真实位置。"
+                )
+            else:
+                self.status_lbl.setText(
+                    f"整体预览：{Path(str(path)).name} · 原始画面 {pix.width()}×{pix.height()} · "
+                    "水印按正式输出的原始坐标绘制。"
+                )
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._fit_pixmap()
+
+    def closeEvent(self, event):
+        self._closing = True
+        worker = self._worker
+        if worker and worker.isRunning():
+            worker.stop()
+            worker.wait(2500)
+        event.accept()
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -946,6 +1350,14 @@ class MainWindow(QMainWindow):
         self._toast = None
         self._toast_queue = []
         self._toast_active = False
+        self._toast_started_at = 0.0
+        self._toast_deadline = 0.0
+        self._toast_duration_ms = 0
+        self._load_app_preferences()
+        self._toast_watchdog_timer = QTimer(self)
+        self._toast_watchdog_timer.setInterval(1200)
+        self._toast_watchdog_timer.timeout.connect(self._check_toast_watchdog)
+        self._toast_watchdog_timer.start()
         self._bg_color = "#000000"     # 背景块默认颜色（随水印文字颜色自动联动）
         self._sec_labels = []          # 需要跟随主题重新着色的分区小标题
         self._div_frames = []          # 需要跟随主题重新着色的分隔线
@@ -955,7 +1367,7 @@ class MainWindow(QMainWindow):
         # 启动阶段只安排后台任务，绝不在 GUI 线程执行 ffmpeg / 编码器探测。
         QTimer.singleShot(0, self._start_startup_checks)
         QTimer.singleShot(2000, self._auto_check_update)
-        QTimer.singleShot(50, self._load_settings)  # 启动后静默检测
+        QTimer.singleShot(50, self._load_settings)  # 恢复上次使用的水印参数
 
     def _toggle_theme(self):
         self._dark = not self._dark
@@ -987,6 +1399,7 @@ class MainWindow(QMainWindow):
                 f"QPushButton{{background:{pal['btn_bg']};border:1px solid {pal['btn_border']};"
                 f"border-radius:13px;color:{pal['btn_fg']};font-size:11px;padding:0 10px;}}"
                 f"QPushButton:hover{{color:{pal['btn_fg_hover']};}}")
+
 
         # 左右面板 + 顶部/底部条
         if self.centralWidget():
@@ -1027,6 +1440,12 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'enc_hint') and not (hasattr(self, 'worker') and self.worker):
             # 编码器提示若非绿/黄的状态色，则跟随主题；已带状态色的场景由 _on_encoder 管理
             pass
+        if hasattr(self, 'preview_btn'):
+            self.preview_btn.setStyleSheet(
+                f"QPushButton{{background:{pal['btn_bg']};border:1px solid {pal['btn_border']};"
+                f"border-radius:8px;color:{pal['btn_fg']};font-size:13px;font-weight:600;}}"
+                "QPushButton:hover{border-color:#3498DB;color:#3498DB;}"
+                "QPushButton:disabled{color:#777;border-color:#888;}")
         if hasattr(self, 'browse_btn'):
             self.browse_btn.setStyleSheet(
                 f"QPushButton{{background:{pal['btn_bg']};border:1px solid {pal['btn_border']};border-radius:6px;color:{pal['btn_fg']};padding:6px;}}"
@@ -1095,6 +1514,7 @@ class MainWindow(QMainWindow):
         self.theme_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.theme_btn.clicked.connect(self._toggle_theme)
 
+
         hr = QHBoxLayout(); hr.setSpacing(8)
         hr.addWidget(self.title_lbl); hr.addWidget(self.tag_lbl)
         hr.addStretch()
@@ -1156,8 +1576,10 @@ class MainWindow(QMainWindow):
 
         vl.addWidget(self._sec("水印字体"))
         self.font_cb = QComboBox()
-        for fn in FONTS: self.font_cb.addItem(fn)
+        for fn in FONTS:
+            self.font_cb.addItem(fn)
         self.font_cb.setCurrentIndex(0)
+        self.font_cb.setToolTip("新增 Roboto、Open Sans、Montserrat 三款免费开放字体；首次使用时会从 Google Fonts 官方仓库下载。")
         vl.addWidget(self.font_cb)
 
         vl.addWidget(self._sec("字体大小"))
@@ -1339,11 +1761,23 @@ class MainWindow(QMainWindow):
         self.total_bar.setTextVisible(False); self.total_bar.setFixedHeight(5)
         self.total_bar.hide()
         self.total_bar.setStyleSheet("QProgressBar{background:#2d2d2d;border-radius:2px;border:none;}QProgressBar::chunk{background:#27ae60;border-radius:2px;}")
+        self.preview_btn = QPushButton("预览水印")
+        self.preview_btn.setFixedSize(94, 44)
+        self.preview_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.preview_btn.setStyleSheet(
+            f"QPushButton{{background:{PALETTE[self._dark]['btn_bg']};border:1px solid {PALETTE[self._dark]['btn_border']};"
+            f"border-radius:8px;color:{PALETTE[self._dark]['btn_fg']};font-size:13px;font-weight:600;}}"
+            "QPushButton:hover{border-color:#3498DB;color:#3498DB;}")
+        self.preview_btn.clicked.connect(self._open_preview)
         self.start_btn = QPushButton("开始处理")
         self.start_btn.setFixedHeight(44)
         self.start_btn.setStyleSheet(self._bstyle("#3498DB","#2980b9"))
         self.start_btn.clicked.connect(self._start_stop)
-        bl.addWidget(self.info_lbl); bl.addWidget(self.total_bar); bl.addWidget(self.start_btn)
+        action_row = QHBoxLayout()
+        action_row.setSpacing(8)
+        action_row.addWidget(self.preview_btn)
+        action_row.addWidget(self.start_btn, 1)
+        bl.addWidget(self.info_lbl); bl.addWidget(self.total_bar); bl.addLayout(action_row)
         outer.addWidget(bottom)
         return panel
 
@@ -1473,10 +1907,52 @@ class MainWindow(QMainWindow):
             self._toast.closed.connect(self._on_toast_closed)
         message, duration, kind = self._toast_queue.pop(0)
         self._toast_active = True
+        self._toast_started_at = time.monotonic()
+        self._toast_duration_ms = duration
+        self._toast_deadline = self._toast_started_at + duration / 1000.0
         self._toast.show_message(message, duration=duration, kind=kind, dark=self._dark)
 
     def _on_toast_closed(self):
         self._toast_active = False
+        self._toast_started_at = 0.0
+        self._toast_deadline = 0.0
+        self._toast_duration_ms = 0
+        QTimer.singleShot(0, self._show_next_toast)
+
+    def _check_toast_watchdog(self):
+        """定期巡检气泡状态；发现计时器失效或异常残留时恢复队列。"""
+        # 后台自检固定开启，不提供用户开关。
+        # 最小化/关闭主窗口时，子控件的可见状态会变化，不应误判为气泡故障。
+        if not self.isVisible() or self.isMinimized():
+            return
+        toast = self._toast
+        now = time.monotonic()
+        if not self._toast_active:
+            if toast and toast.isVisible():
+                toast._timer.stop()
+                toast.hide()
+            return
+        if toast is None:
+            self._recover_toast_state()
+            return
+        if not toast.isVisible():
+            self._recover_toast_state()
+            return
+        deadline = self._toast_deadline
+        if deadline and now > deadline + 3.0:
+            self._recover_toast_state()
+
+    def _recover_toast_state(self):
+        '隐藏卡住的气泡并恢复提醒队列；不修改视频任务状态，也不伪造完成提示。'
+        toast = self._toast
+        self._toast_active = False
+        self._toast_started_at = 0.0
+        self._toast_deadline = 0.0
+        self._toast_duration_ms = 0
+        if toast:
+            toast._timer.stop()
+            toast.hide()
+        # 当前卡住的那条提醒作废，后续队列继续正常显示。
         QTimer.singleShot(0, self._show_next_toast)
 
     def _reposition_toast(self):
@@ -1487,6 +1963,45 @@ class MainWindow(QMainWindow):
         n = len(self.file_rows)
         self.files_lbl.setText(f"已选文件 ({n})")
         self.start_btn.setText(f"开始处理  ({n} 个文件)" if n else "开始处理")
+        if hasattr(self, "preview_btn"):
+            self.preview_btn.setEnabled(n > 0 and not (self.worker and self.worker.isRunning()))
+
+    def _load_app_preferences(self):
+        """固定默认行为：开始前总是确认；启动检测静默显示；气泡自恢复与更新检测常开。"""
+        self._confirm_before_start = True
+        self._startup_toast_enabled = False
+        self._toast_watchdog_enabled = True
+        self._auto_update_enabled = True
+        self._preview_time_sec = 1.0
+
+    def _current_watermark_params(self):
+        return {
+            "text": self.wm_text.text(),
+            "font": self.font_cb.currentText(),
+            "font_size": self.font_sl.value(),
+            "color": self.color_sw.get(),
+            "opacity": self.op_sl.value(),
+            "position": self._current_pos,
+            "margin": self.mg_sl.value(),
+            "border_on": self.border_chk.isChecked(),
+            "border_w": self.border_sl.value(),
+            "bg_on": self.bg_chk.isChecked(),
+            "bg_color": self._bg_color,
+        }
+
+    def _open_preview(self):
+        paths = [row.filepath for row in self.file_rows]
+        if not paths:
+            self._show_toast("请先添加视频文件，再预览水印效果", 2500, "info")
+            return
+        if self.worker and self.worker.isRunning():
+            self._show_toast("视频处理中，暂时无法打开水印预览", 2500, "warning")
+            return
+        dlg = PreviewDialog(
+            self, paths, self._current_watermark_params(),
+            timestamp=self._preview_time_sec, dark=self._dark
+        )
+        dlg.exec()
 
     def _start_stop(self):
         # 正在处理中 → 点击变停止
@@ -1499,6 +2014,25 @@ class MainWindow(QMainWindow):
         # 没有文件
         if not self.file_rows:
             self._show_toast("请先添加视频文件", 2500, "info")
+            return
+
+        # 每次开始批量处理前都必须确认当前水印和位置，不提供关闭选项。
+        confirm_box = QMessageBox(self)
+        confirm_box.setWindowTitle("确认开始处理")
+        confirm_box.setIcon(QMessageBox.Icon.Question)
+        confirm_box.setText("是否开始批量处理？")
+        wm_text = self.wm_text.text().strip() or "（空水印文字）"
+        confirm_box.setInformativeText(
+            f"待处理视频：{len(self.file_rows)} 个\n"
+            f"当前水印：{wm_text}\n"
+            f"水印位置：{self._current_pos}\n\n"
+            "请确认水印内容和位置无误后再开始。"
+        )
+        start_now = confirm_box.addButton("开始处理", QMessageBox.ButtonRole.AcceptRole)
+        confirm_box.addButton("再检查一下", QMessageBox.ButtonRole.RejectRole)
+        confirm_box.setDefaultButton(start_now)
+        confirm_box.exec()
+        if confirm_box.clickedButton() is not start_now:
             return
 
         # 重置状态
@@ -1567,11 +2101,13 @@ class MainWindow(QMainWindow):
         self.worker.encoder_detected.connect(self._on_encoder)
         self.worker.progress.connect(self._on_prog)
         self.worker.file_done.connect(self._on_done)
+        self.worker.fatal_error.connect(self._on_worker_fatal_error)
         self.worker.all_done.connect(self._on_all_done)
         self.worker.start()
 
         self.start_btn.setText("停止处理")
         self.start_btn.setStyleSheet(self._bstyle("#c0392b", "#a93226"))
+        self.preview_btn.setEnabled(False)
         self._set_right_panel_enabled(False)
 
     def _on_encoder(self, enc):
@@ -1586,6 +2122,13 @@ class MainWindow(QMainWindow):
         elif enc == "h264_nvenc":
             self.enc_hint.setToolTip("NVIDIA NVENC 实际编码测试通过。")
         self.enc_hint.setStyleSheet(f"font-size:11px;color:{color};")
+
+    def _on_worker_fatal_error(self, message):
+        self._done_count = self._total
+        self._failed_count = self._total
+        for row in self.file_rows:
+            row.set_done(False)
+        self._show_toast(str(message), 6000, "error")
 
     def _on_prog(self, idx, pct, speed):
         if idx < len(self.file_rows): self.file_rows[idx].set_progress(pct)
@@ -1611,6 +2154,7 @@ class MainWindow(QMainWindow):
         self.start_btn.setEnabled(True)
         self.start_btn.setText(f"开始处理  ({len(self.file_rows)} 个文件)")
         self.start_btn.setStyleSheet(self._bstyle("#3498DB","#2980b9"))
+        self.preview_btn.setEnabled(bool(self.file_rows))
         failed = self._failed_count
         if failed:
             self._show_toast(f"批量处理完成：成功 {self._total - failed} 个，失败 {failed} 个", 4000, "warning")
@@ -1637,7 +2181,7 @@ class MainWindow(QMainWindow):
             self.tag_lbl.show()
             self.tag_lbl.raise_()
             self.start_btn.setEnabled(False)
-            if error:
+            if error and self._startup_toast_enabled:
                 self._show_toast(f"FFmpeg 检测失败：{error}", 5000, "error")
             self._startup_worker = None
             return
@@ -1646,7 +2190,8 @@ class MainWindow(QMainWindow):
         self._on_encoder(encoder)
         # 启动时只提醒 FFmpeg 和实际检测到的 GPU；编码器名称保留在主界面状态文字中，
         # 不再单独弹 Toast，避免启动阶段连续弹出过多通知。
-        self._show_toast("✓ FFmpeg 检测正常", 1800, "success")
+        if self._startup_toast_enabled:
+            self._show_toast("✓ FFmpeg 检测正常", 1800, "success")
         if encoder in ("h264_nvenc", "h264_qsv", "h264_amf"):
             # GPU 名称与硬件编码器分开检测，再按实际编码器选择对应显卡，
             # 避免机器同时存在核显+独显时把“第一块显卡”误报成当前加速设备。
@@ -1661,14 +2206,17 @@ class MainWindow(QMainWindow):
                 if vendor.lower() in item.lower():
                     selected_gpu = item.strip()
                     break
-            self._show_toast(f"⚡ {gpu_title}", 1800, "success")
+            if self._startup_toast_enabled:
+                self._show_toast(f"⚡ {gpu_title}", 1800, "success")
             if selected_gpu:
                 self.enc_hint.setToolTip(f"当前加速设备：{selected_gpu}")
         elif gpu_name:
-            self._show_toast("⚠ 已检测到 GPU，但硬件编码不可用", 2200, "warning")
+            if self._startup_toast_enabled:
+                self._show_toast("⚠ 已检测到 GPU，但硬件编码不可用", 2200, "warning")
             self.enc_hint.setToolTip(f"检测到：{gpu_name}")
         else:
-            self._show_toast("⚠ 未检测到可用 GPU 加速", 2200, "warning")
+            if self._startup_toast_enabled:
+                self._show_toast("⚠ 未检测到可用 GPU 加速", 2200, "warning")
         self.start_btn.setEnabled(True)
         self._startup_worker = None
 
@@ -1695,6 +2243,7 @@ class MainWindow(QMainWindow):
         except Exception: return False
 
     def _auto_check_update(self):
+        '启动时必须检查软件更新，不提供取消选项。'
         self._run_checker(silent=True)
 
     def _check_update(self):
@@ -1726,12 +2275,14 @@ class MainWindow(QMainWindow):
             self.update_btn.setStyleSheet("QPushButton{background:#e67e22;border:none;border-radius:11px;color:#fff;font-size:11px;font-weight:600;padding:0 12px;}QPushButton:hover{background:#d35400;}QPushButton:pressed{background:#b94600;}")
             auto_ok = bool(setup_url and setup_digest and self._is_installed_build())
             self.update_btn.setToolTip(f"新版本 {latest} 可用，点击后可后台下载并直接更新" if auto_ok else f"新版本 {latest} 可用，点击查看下载页")
-            self._show_toast(f"发现新版本 {latest} · 点击左下角「有可用更新」查看", 2000, "info")
+            if not silent:
+                self._show_toast(f"发现新版本 {latest} · 点击左下角「有可用更新」查看", 2000, "info")
         else:
             self.update_btn.setText("当前最新版 ✓")
             self.update_btn.setStyleSheet("QPushButton{background:transparent;border:1px solid #27ae60;border-radius:11px;color:#27ae60;font-size:11px;padding:0 10px;}QPushButton:hover{background:rgba(39,174,96,0.1);}")
             self.update_btn.setToolTip("")
-            self._show_toast(f"当前已是最新版本 {APP_VERSION}", 2000, "success")
+            if not silent:
+                self._show_toast(f"当前已是最新版本 {APP_VERSION}", 2000, "success")
 
     def _on_update_error(self, msg):
         self.update_btn.setEnabled(True)
@@ -1768,7 +2319,8 @@ class MainWindow(QMainWindow):
         self.update_btn.setToolTip(detail)
 
         if silent:
-            self._show_toast(f"自动检查更新失败：{reason} 鼠标悬停在「检测更新」上可查看详情。", 6000, "warning")
+            # 静默启动检测只更新按钮状态和悬停详情，不弹出右上角气泡。
+            pass
         else:
             # 检测失败时提供直达 Releases 页面的按钮，便于绕过 GitHub API 限流手动查看。
             dialog = QMessageBox(self)
@@ -1831,7 +2383,8 @@ class MainWindow(QMainWindow):
         s = QSettings("VideoWatermark", "Settings")
         if s.value("wm_text") is None: return   # 首次运行，使用默认值
         self.wm_text.setText(s.value("wm_text", "AI-Generated (Audio & Visuals)"))
-        font = s.value("font", "Arial")
+        font = str(s.value("font", "通用无衬线（Arial）"))
+        font = LEGACY_FONT_LABELS.get(font, font)
         idx = self.font_cb.findText(font)
         if idx >= 0: self.font_cb.setCurrentIndex(idx)
         self.font_sl.setValue(int(s.value("font_size", 20)))
