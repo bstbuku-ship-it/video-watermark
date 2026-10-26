@@ -10,7 +10,7 @@ REPO         = "bstbuku-ship-it/video-watermark"
 RELEASES_URL = f"https://github.com/{REPO}/releases/latest"
 API_URL      = f"https://api.github.com/repos/{REPO}/releases/latest"
 
-import sys, os, subprocess, platform, re, base64, tempfile, hashlib, time
+import sys, os, subprocess, platform, re, base64, tempfile, hashlib, time, html
 import urllib.request, urllib.error, urllib.parse, json
 from PyQt6.QtCore import QSettings, QUrl
 from pathlib import Path
@@ -46,13 +46,25 @@ def _parse_semver(value):
 
 
 def _escape_drawtext_text(value):
-    """按 FFmpeg filtergraph 规则安全转义用户可控的水印文字。"""
+    """按 FFmpeg filtergraph 的多层转义规则处理用户可控水印文字。"""
     text = str(value or "")
-    # drawtext 默认会解释 %{...}；关闭 expansion 后再处理 filtergraph 层特殊字符。
-    text = text.replace("\\", "\\\\")
-    for ch in ("'", ":", ",", ";", "[", "]"):
-        text = text.replace(ch, "\\" + ch)
-    return text
+    escaped = []
+    saw_quote = False
+    # FFmpeg 先解析 filtergraph，再解析 drawtext 选项；单引号后的冒号需要额外转义。
+    # 使用逐字符处理，避免连续 replace 让新加入的反斜杠再次被转义。
+    for ch in text:
+        if ch == "\\":
+            escaped.append("\\\\")
+        elif ch == "'":
+            escaped.append("\\\\\\'")
+            saw_quote = True
+        elif ch == ":":
+            escaped.append("\\\\:" if saw_quote else "\\:")
+        elif ch in (",", ";", "[", "]"):
+            escaped.append("\\" + ch)
+        else:
+            escaped.append(ch)
+    return "".join(escaped)
 
 
 def _is_trusted_github_asset_url(url):
@@ -74,6 +86,64 @@ def _is_trusted_github_asset_url(url):
         )
     except Exception:
         return False
+
+
+def _is_trusted_github_download_response_url(url):
+    """GitHub Releases 资产允许跳转到 GitHub 官方资产域名，不接受任意外部重定向。"""
+    try:
+        parsed = urllib.parse.urlparse(str(url or ""))
+        return (
+            parsed.scheme.lower() == "https"
+            and parsed.hostname in {
+                "github.com",
+                "release-assets.githubusercontent.com",
+                "objects.githubusercontent.com",
+                "github-releases.githubusercontent.com",
+            }
+            and parsed.port in (None, 443)
+            and parsed.username is None
+            and parsed.password is None
+            and not parsed.fragment
+        )
+    except Exception:
+        return False
+
+
+def _is_trusted_github_release_page_url(url):
+    """只允许打开当前项目的 GitHub Releases 页面，拒绝 API 返回的外部跳转地址。"""
+    try:
+        parsed = urllib.parse.urlparse(str(url or ""))
+        path = urllib.parse.unquote(parsed.path)
+        return (
+            parsed.scheme.lower() == "https"
+            and parsed.hostname == "github.com"
+            and parsed.port in (None, 443)
+            and parsed.username is None
+            and parsed.password is None
+            and not parsed.query
+            and not parsed.fragment
+            and path.startswith(f"/{REPO}/releases/")
+            and "\\" not in path
+            and all(part not in (".", "..") for part in path.split("/"))
+        )
+    except Exception:
+        return False
+
+
+def _canonical_path(path):
+    """解析符号链接后规范化路径，避免通过别名把输出写回输入视频。"""
+    return os.path.normcase(os.path.realpath(os.path.abspath(os.fspath(path))))
+
+
+def _show_plain_message(parent, icon, title, message):
+    """以纯文本显示含有用户文件名/路径的错误，避免 QLabel/QMessageBox 自动解析富文本。"""
+    box = QMessageBox(parent)
+    box.setIcon(icon)
+    box.setWindowTitle(str(title))
+    box.setTextFormat(Qt.TextFormat.PlainText)
+    box.setText(str(message))
+    box.setStandardButtons(QMessageBox.StandardButton.Ok)
+    box.exec()
 
 
 def _validate_output_prefix(prefix):
@@ -114,20 +184,21 @@ LEGACY_FONT_LABELS = {
 }
 
 FONT_DOWNLOADS = {
+    # 固定到 Google Fonts METADATA.pb 所引用的上游提交，避免运行时跟随可变 main 分支。
     "现代简洁（Roboto）": (
         "Roboto[wdth,wght].ttf",
-        "https://raw.githubusercontent.com/google/fonts/main/ofl/roboto/Roboto%5Bwdth,wght%5D.ttf",
-        "https://raw.githubusercontent.com/google/fonts/main/ofl/roboto/OFL.txt",
+        "https://raw.githubusercontent.com/googlefonts/roboto-classic/91d5d3e5b81efa04a77925cc609fdcdd7ee663d1/web/split/Roboto%5Bwdth,wght%5D.ttf",
+        "https://raw.githubusercontent.com/googlefonts/roboto-classic/91d5d3e5b81efa04a77925cc609fdcdd7ee663d1/OFL.txt",
     ),
     "清晰易读（Open Sans）": (
         "OpenSans[wdth,wght].ttf",
-        "https://raw.githubusercontent.com/google/fonts/main/ofl/opensans/OpenSans%5Bwdth,wght%5D.ttf",
-        "https://raw.githubusercontent.com/google/fonts/main/ofl/opensans/OFL.txt",
+        "https://raw.githubusercontent.com/googlefonts/opensans/bd7e37632246368c60fdcbd374dbf9bad11969b6/fonts/variable/OpenSans%5Bwdth,wght%5D.ttf",
+        "https://raw.githubusercontent.com/googlefonts/opensans/bd7e37632246368c60fdcbd374dbf9bad11969b6/OFL.txt",
     ),
     "醒目标题（Montserrat）": (
         "Montserrat[wght].ttf",
-        "https://raw.githubusercontent.com/google/fonts/main/ofl/montserrat/Montserrat%5Bwght%5D.ttf",
-        "https://raw.githubusercontent.com/google/fonts/main/ofl/montserrat/OFL.txt",
+        "https://raw.githubusercontent.com/JulietaUla/Montserrat/cc8daf2e7085006b9c112542fc82b58afc13521d/fonts/variable/Montserrat%5Bwght%5D.ttf",
+        "https://raw.githubusercontent.com/JulietaUla/Montserrat/cc8daf2e7085006b9c112542fc82b58afc13521d/OFL.txt",
     ),
 }
 
@@ -140,34 +211,105 @@ def _font_cache_dir():
     return base
 
 
-def _download_open_font(url, destination, max_bytes=18 * 1024 * 1024):
-    '仅从 Google Fonts 官方 GitHub 原始文件域下载字体，限制大小并校验字体文件头。'
-    parsed = urllib.parse.urlparse(str(url))
-    if (parsed.scheme != "https" or parsed.hostname != "raw.githubusercontent.com"
-            or not parsed.path.startswith("/google/fonts/main/ofl/")):
-        raise RuntimeError("字体下载地址不是受信任的 Google Fonts 官方文件地址。")
-    req = urllib.request.Request(url, headers={"User-Agent": "video-watermark-font-loader"})
-    temp = destination.with_suffix(destination.suffix + ".download")
+def _is_trusted_font_resource_url(url):
+    """字体和许可证只允许访问源码中明确固定提交的官方上游文件。"""
+    value = str(url or "")
     try:
-        total = 0
-        with urllib.request.urlopen(req, timeout=25) as response, open(temp, "wb") as out:
-            while True:
-                chunk = response.read(256 * 1024)
-                if not chunk:
-                    break
-                total += len(chunk)
-                if total > max_bytes:
-                    raise RuntimeError("字体文件大小超出允许范围，已取消下载。")
-                out.write(chunk)
-        with open(temp, "rb") as f:
+        parsed = urllib.parse.urlparse(value)
+        allowed = {
+            resource_url
+            for _filename, font_url, license_url in FONT_DOWNLOADS.values()
+            for resource_url in (font_url, license_url)
+        }
+        return (
+            value in allowed
+            and parsed.scheme.lower() == "https"
+            and parsed.hostname == "raw.githubusercontent.com"
+            and parsed.port in (None, 443)
+            and parsed.username is None
+            and parsed.password is None
+            and not parsed.query
+            and not parsed.fragment
+        )
+    except Exception:
+        return False
+
+
+def _is_valid_cached_font(path, max_bytes=18 * 1024 * 1024):
+    """缓存字体必须是普通文件、大小合理并具有合法的 TTF/OTF 字体签名。"""
+    try:
+        if path.is_symlink() or not path.is_file():
+            return False
+        size = path.stat().st_size
+        if size < 4 or size > max_bytes:
+            return False
+        with path.open("rb") as f:
             signature = f.read(4)
-        if signature not in (b"\x00\x01\x00\x00", b"OTTO", b"true", b"ttcf"):
+        return signature in (b"\x00\x01\x00\x00", b"OTTO", b"true", b"ttcf")
+    except OSError:
+        return False
+
+
+def _atomic_write_bytes(destination, payload):
+    """在目标目录创建独占临时文件，再原子替换，避免可预测临时路径的符号链接风险。"""
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(
+        prefix=destination.name + ".", suffix=".tmp", dir=str(destination.parent)
+    )
+    temp = Path(temp_name)
+    try:
+        with os.fdopen(fd, "wb") as out:
+            out.write(payload)
+            out.flush()
+        os.replace(str(temp), str(destination))
+    finally:
+        try:
+            temp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _download_open_font(url, destination, max_bytes=18 * 1024 * 1024):
+    """从固定提交的官方字体源码下载；限制响应体大小并校验响应地址与字体签名。"""
+    if not _is_trusted_font_resource_url(url):
+        raise RuntimeError("字体下载地址不是已固定版本的受信任官方文件地址。")
+    req = urllib.request.Request(url, headers={"User-Agent": "video-watermark-font-loader"})
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(
+        prefix=destination.name + ".", suffix=".download", dir=str(destination.parent)
+    )
+    temp = Path(temp_name)
+    try:
+        with os.fdopen(fd, "wb") as out:
+            with urllib.request.urlopen(req, timeout=25) as response:
+                if response.geturl() != url:
+                    raise RuntimeError("字体下载发生意外重定向，已取消。")
+                content_length = response.headers.get("Content-Length")
+                if content_length:
+                    try:
+                        if int(content_length) > max_bytes:
+                            raise RuntimeError("字体文件大小超出允许范围，已取消下载。")
+                    except ValueError:
+                        raise RuntimeError("字体服务器返回了无效的文件长度。")
+                total = 0
+                while True:
+                    chunk = response.read(256 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise RuntimeError("字体文件大小超出允许范围，已取消下载。")
+                    out.write(chunk)
+                out.flush()
+        if not _is_valid_cached_font(temp, max_bytes=max_bytes):
             raise RuntimeError("下载内容不是有效的 TTF/OTF 字体文件。")
         os.replace(str(temp), str(destination))
     finally:
         try:
             temp.unlink(missing_ok=True)
-        except Exception:
+        except OSError:
             pass
 
 
@@ -190,17 +332,31 @@ def _resolve_font_file(font_name):
         filename, font_url, license_url = spec
         cache = _font_cache_dir()
         dest = cache / filename
-        if not dest.is_file():
+        if not _is_valid_cached_font(dest):
+            try:
+                dest.unlink(missing_ok=True)
+            except OSError:
+                pass
             _download_open_font(font_url, dest)
-        # 一并保存 OFL 许可文本；许可下载失败不影响已下载字体使用。
+        # 一并保存 OFL 许可文本；仅在来源固定、响应地址匹配且大小受限时写入。
         license_path = cache / (Path(filename).stem + "-OFL.txt")
         if not license_path.is_file():
             try:
+                if not _is_trusted_font_resource_url(license_url):
+                    raise RuntimeError("字体许可证地址未通过校验。")
                 req = urllib.request.Request(license_url, headers={"User-Agent": "video-watermark-font-loader"})
                 with urllib.request.urlopen(req, timeout=10) as response:
-                    license_text = response.read(512 * 1024).decode("utf-8", errors="replace")
-                license_path.write_text(license_text, encoding="utf-8")
+                    if response.geturl() != license_url:
+                        raise RuntimeError("字体许可证下载发生意外重定向。")
+                    license_data = response.read(512 * 1024 + 1)
+                if len(license_data) > 512 * 1024:
+                    raise RuntimeError("字体许可证文件大小超出允许范围。")
+                license_text = license_data.decode("utf-8", errors="strict")
+                if "SIL OPEN FONT LICENSE" not in license_text.upper():
+                    raise RuntimeError("下载的文本不是预期的 SIL Open Font License。")
+                _atomic_write_bytes(license_path, license_data)
             except Exception:
+                # 字体本身可用时，许可证副本下载失败不阻断渲染；发布包应另附许可证清单。
                 pass
         return str(dest.resolve())
     raise FileNotFoundError(f"未知水印字体：{font_name}")
@@ -504,11 +660,19 @@ class UpdateChecker(QThread):
             req = urllib.request.Request(
                 API_URL, headers={"User-Agent": "video-watermark-updater"})
             with urllib.request.urlopen(req, timeout=8) as resp:
-                data = json.loads(resp.read().decode())
+                if resp.geturl() != API_URL:
+                    raise RuntimeError("更新 API 发生意外重定向，已取消检查。")
+                payload = resp.read(4 * 1024 * 1024 + 1)
+            if len(payload) > 4 * 1024 * 1024:
+                raise RuntimeError("更新 API 响应过大，已取消检查。")
+            data = json.loads(payload.decode("utf-8"))
+            if not isinstance(data, dict):
+                raise RuntimeError("更新 API 返回的数据格式无效。")
 
-            tag  = data.get("tag_name", "")
-            url  = data.get("html_url", RELEASES_URL)
-            body = (data.get("body") or "").strip()
+            tag = str(data.get("tag_name", "") or "")[:128]
+            candidate_page = str(data.get("html_url", "") or "")
+            url = candidate_page if _is_trusted_github_release_page_url(candidate_page) else RELEASES_URL
+            body = str(data.get("body") or "").strip()[:1_000_000]
 
             setup_url = ""
             setup_name = ""
@@ -546,48 +710,74 @@ class UpdateDownloadWorker(QThread):
         self.filename = filename or "video-watermark-update-Setup.exe"
 
     def run(self):
+        temp_path = None
         try:
             if not _is_trusted_github_asset_url(self.url):
                 raise RuntimeError("更新地址不是受信任的 GitHub 官方下载地址。")
             if not re.fullmatch(r"[0-9a-fA-F]{64}", self.expected_sha256):
                 raise RuntimeError("新版安装包缺少有效 SHA-256 校验值，已停止自动更新。")
 
+            filename = str(self.filename or "video-watermark-update-Setup.exe")
+            # 不接受路径分隔符或 Windows 文件名控制字符，避免 API 资产名影响落盘位置。
+            if (Path(filename).name != filename or any(ch in filename for ch in '<>:\"/\\|?*')
+                    or not filename.lower().endswith("-setup.exe")):
+                raise RuntimeError("更新安装包文件名不符合安全要求。")
+
             update_dir = Path(tempfile.gettempdir()) / "VideoWatermarkUpdate"
             update_dir.mkdir(parents=True, exist_ok=True)
-            target = update_dir / self.filename
-            temp_path = target.with_suffix(target.suffix + ".download")
-
+            if update_dir.is_symlink() or not update_dir.is_dir():
+                raise RuntimeError("更新临时目录无效或不安全。")
+            target = update_dir / filename
+            fd, temp_name = tempfile.mkstemp(
+                prefix=filename + ".", suffix=".download", dir=str(update_dir)
+            )
+            temp_path = Path(temp_name)
             req = urllib.request.Request(
                 self.url, headers={"User-Agent": "video-watermark-updater"})
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                total = int(resp.headers.get("Content-Length", "0") or 0)
-                downloaded = 0
-                digest = hashlib.sha256()
+            downloaded = 0
+            digest = hashlib.sha256()
+            max_bytes = 1024 * 1024 * 1024  # 1 GiB 防止异常响应导致磁盘耗尽。
 
-                with open(temp_path, "wb") as f:
+            with os.fdopen(fd, "wb") as f:
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    if not _is_trusted_github_download_response_url(resp.geturl()):
+                        raise RuntimeError("更新下载发生到非受信任主机的重定向，已取消。")
+                    raw_total = resp.headers.get("Content-Length", "0") or "0"
+                    try:
+                        total = int(raw_total)
+                    except ValueError:
+                        raise RuntimeError("更新服务器返回了无效的文件长度。")
+                    if total < 0 or total > max_bytes:
+                        raise RuntimeError("更新安装包大小超出允许范围，已取消下载。")
                     while True:
                         chunk = resp.read(1024 * 256)
                         if not chunk:
                             break
+                        downloaded += len(chunk)
+                        if downloaded > max_bytes:
+                            raise RuntimeError("更新安装包大小超出允许范围，已取消下载。")
                         f.write(chunk)
                         digest.update(chunk)
-                        downloaded += len(chunk)
                         pct = int(downloaded * 100 / total) if total > 0 else 0
                         self.progress.emit(pct, downloaded)
+                    f.flush()
 
             actual = digest.hexdigest().lower()
-            if self.expected_sha256 and actual != self.expected_sha256:
-                try:
-                    temp_path.unlink()
-                except Exception:
-                    pass
+            if actual != self.expected_sha256:
                 raise RuntimeError("更新文件校验失败，已停止安装。")
 
             os.replace(str(temp_path), str(target))
+            temp_path = None
             self.progress.emit(100, downloaded)
             self.finished.emit(str(target))
         except Exception as e:
             self.error.emit(str(e))
+        finally:
+            if temp_path is not None:
+                try:
+                    temp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
 
 class StartupCheckWorker(QThread):
@@ -747,7 +937,8 @@ class FileRowWidget(QWidget):
         self.icon.setStyleSheet("color:#3498DB;font-size:13px;")
         # 长文件名中间省略，前后片段+后缀保留，避免撑破布局需要左右滑动
         self.name = QLabel(elide_filename(p.name))
-        self.name.setToolTip(p.name)
+        self.name.setTextFormat(Qt.TextFormat.PlainText)
+        self.name.setToolTip(html.escape(p.name))
         self.name.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self.name.setMinimumWidth(0)
         self.status = QLabel("等待"); self.status.setFixedWidth(72)
@@ -758,6 +949,7 @@ class FileRowWidget(QWidget):
         top.addWidget(self.icon); top.addWidget(self.name); top.addWidget(self.status); top.addWidget(rm)
         sz   = self._fmt(p.stat().st_size) if p.exists() else ""
         self.info = QLabel(f"{sz}  ·  {p.suffix.upper().lstrip('.')}  ·  {str(p.parent)[:48]}")
+        self.info.setTextFormat(Qt.TextFormat.PlainText)
         self.info.setStyleSheet("font-size:11px;margin-left:26px;")
         self.bar = QProgressBar()
         self.bar.setRange(0,100); self.bar.setValue(0)
@@ -843,9 +1035,11 @@ class Toast(QWidget):
         self.setWindowFlags(Qt.WindowType.Widget | Qt.WindowType.FramelessWindowHint)
 
         self.title_label = QLabel(self)
+        self.title_label.setTextFormat(Qt.TextFormat.PlainText)
         self.title_label.setWordWrap(True)
         self.title_label.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
         self.subtitle_label = QLabel(self)
+        self.subtitle_label.setTextFormat(Qt.TextFormat.PlainText)
         self.subtitle_label.setWordWrap(True)
         self.subtitle_label.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
 
@@ -1001,6 +1195,7 @@ class UpdateDialog(QDialog):
         self.changelog_box.setStyleSheet(f"QTextEdit{{background:{pal['input_bg']};color:{pal['input_text']};border:1px solid {pal['border']};border-radius:8px;padding:10px;font-size:12.5px;}}")
         vl.addWidget(self.changelog_box, stretch=1)
         self.progress_label = QLabel("")
+        self.progress_label.setTextFormat(Qt.TextFormat.PlainText)
         self.progress_label.setStyleSheet(f"font-size:11px;color:{pal['text_secondary']};")
         self.progress_label.hide()
         vl.addWidget(self.progress_label)
@@ -1163,6 +1358,7 @@ class PreviewDialog(QDialog):
         root.addLayout(controls)
 
         self.image_label = QLabel("正在生成静态预览…")
+        self.image_label.setTextFormat(Qt.TextFormat.PlainText)
         self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.image_label.setMinimumSize(620, 360)
         self.image_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -1173,6 +1369,7 @@ class PreviewDialog(QDialog):
         root.addWidget(self.image_label, 1)
 
         self.status_lbl = QLabel("预览为静态画面，不播放视频。")
+        self.status_lbl.setTextFormat(Qt.TextFormat.PlainText)
         self.status_lbl.setStyleSheet(f"font-size:11px;color:{pal['text_muted']};")
         root.addWidget(self.status_lbl)
 
@@ -1713,6 +1910,7 @@ class MainWindow(QMainWindow):
         self.enc_cb.setToolTip("自动检测失败时可手动指定显卡")
         vl.addWidget(self.enc_cb)
         self.enc_hint = QLabel("编码器检测中…")
+        self.enc_hint.setTextFormat(Qt.TextFormat.PlainText)
         self.enc_hint.setStyleSheet("font-size:12px;color:#888;")
         self.enc_hint.setWordWrap(True)
         vl.addWidget(self.enc_hint)
@@ -1753,6 +1951,7 @@ class MainWindow(QMainWindow):
         bottom.setStyleSheet("background:#252525;border-top:1px solid #2a2a2a;")
         bl = QVBoxLayout(bottom); bl.setContentsMargins(18,10,18,16); bl.setSpacing(5)
         self.info_lbl = QLabel("")
+        self.info_lbl.setTextFormat(Qt.TextFormat.PlainText)
         self.info_lbl.setStyleSheet("font-size:11px;color:#666;")
         self.info_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.info_lbl.hide()
@@ -2020,6 +2219,7 @@ class MainWindow(QMainWindow):
         confirm_box = QMessageBox(self)
         confirm_box.setWindowTitle("确认开始处理")
         confirm_box.setIcon(QMessageBox.Icon.Question)
+        confirm_box.setTextFormat(Qt.TextFormat.PlainText)
         confirm_box.setText("是否开始批量处理？")
         wm_text = self.wm_text.text().strip() or "（空水印文字）"
         confirm_box.setInformativeText(
@@ -2051,7 +2251,7 @@ class MainWindow(QMainWindow):
         output_ext = self.format_cb.currentData() or ".mp4"
         tasks   = []
         output_paths = set()
-        input_paths = {os.path.normcase(os.path.abspath(r.filepath)) for r in self.file_rows}
+        input_paths = {_canonical_path(r.filepath) for r in self.file_rows}
         for r in self.file_rows:
             p = Path(r.filepath)
             d = Path(out_dir) if out_dir else p.parent
@@ -2059,16 +2259,16 @@ class MainWindow(QMainWindow):
             # 其他输入格式：输出统一改为用户选择的后缀，由当前 FFmpeg 处理流程完成转码。
             output_name = prefix + p.stem + output_ext
             output_path = d / output_name
-            normalized_output = os.path.normcase(os.path.abspath(str(output_path)))
+            normalized_output = _canonical_path(output_path)
             if normalized_output in input_paths:
-                QMessageBox.warning(
-                    self, "输出文件冲突",
+                _show_plain_message(
+                    self, QMessageBox.Icon.Warning, "输出文件冲突",
                     f"输出文件不能覆盖输入文件：\n{output_path}"
                 )
                 return
             if normalized_output in output_paths:
-                QMessageBox.warning(
-                    self, "输出文件冲突",
+                _show_plain_message(
+                    self, QMessageBox.Icon.Warning, "输出文件冲突",
                     f"多个输入文件会写入同一个输出文件：\n{output_path}"
                 )
                 return
@@ -2326,6 +2526,7 @@ class MainWindow(QMainWindow):
             dialog = QMessageBox(self)
             dialog.setIcon(QMessageBox.Icon.Warning)
             dialog.setWindowTitle("版本检测失败")
+            dialog.setTextFormat(Qt.TextFormat.PlainText)
             dialog.setText(f"{reason}\n\n{advice}\n\n详细错误信息：\n{raw}")
             releases_button = dialog.addButton("前往 Releases", QMessageBox.ButtonRole.ActionRole)
             dialog.addButton(QMessageBox.StandardButton.Ok)
@@ -2545,7 +2746,7 @@ if __name__ == "__main__":
             win_holder["win"].activateWindow()
         except Exception as exc:
             splash.close()
-            QMessageBox.critical(None, "启动失败", f"程序启动失败：\n{exc}")
+            _show_plain_message(None, QMessageBox.Icon.Critical, "启动失败", f"程序启动失败：\n{exc}")
             raise
 
     QTimer.singleShot(0, build_main_window)
